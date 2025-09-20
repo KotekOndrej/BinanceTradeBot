@@ -15,6 +15,7 @@ import requests
 from azure.storage.blob import BlobServiceClient, ContainerClient, BlobClient, AppendBlobClient
 from azure.core.exceptions import ResourceNotFoundError, ResourceExistsError
 
+
 # ------------------ ENV & CONFIG ------------------
 
 def _get_env(name: str, default: str | None = None, required: bool = False) -> str | None:
