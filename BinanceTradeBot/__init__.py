@@ -88,7 +88,7 @@ TIMEOUT_SEC_PER_TICK = _get_int("TIMEOUT_SEC_PER_TICK", 20)
 PAIRS_MODELS = _parse_pairs_models(os.getenv("PAIRS_MODELS", ""))
 
 # Storage (jen názvy; klienty vytvoříme až v main)
-WEBJOBS_CONN      = _get_env("AzureWebJobsStorage", None)  # ne required=True na modulu
+WEBJOBS_CONN      = _get_env("AzureWebJobsStorage", None)
 SIGNALS_CONTAINER = _get_env("SIGNALS_CONTAINER", "market-signals")
 MASTER_CSV_NAME   = _get_env("MASTER_CSV_NAME", "bs_levels_master.csv")
 TRADES_CONTAINER  = _get_env("TRADES_CONTAINER", "trade-logs")
@@ -98,7 +98,7 @@ logger = logging.getLogger("BinanceTradeBot")
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
 
-# ------------------ BINANCE REST (imports uvnitř funkcí) ------------------
+# ------------------ BINANCE REST ------------------
 
 def _ts_ms() -> int:
     return int(time.time() * 1000)
@@ -111,7 +111,7 @@ def _headers() -> Dict[str, str]:
     return {"X-MBX-APIKEY": BINANCE_API_KEY or "", "Content-Type": "application/x-www-form-urlencoded"}
 
 def binance_get(path: str, params: Optional[Dict] = None, signed: bool = False):
-    import requests  # import až při volání
+    import requests
     url = f"{BINANCE_BASE_URL}{path}"
     params = params or {}
     if signed:
@@ -120,13 +120,16 @@ def binance_get(path: str, params: Optional[Dict] = None, signed: bool = False):
         params["timestamp"] = _ts_ms()
         params["recvWindow"] = 5000
         params["signature"] = _sign(params, BINANCE_API_SECRET)
+
+    logger.info("[BINANCE][GET] %s params=%s", url, params)
+
     r = requests.get(url, params=params, headers=_headers(), timeout=20)
     if r.status_code == 200:
         return r.json()
     raise RuntimeError("GET {0} {1}: {2}".format(path, r.status_code, r.text[:200]))
 
 def binance_post(path: str, params: Dict, signed: bool = True):
-    import requests  # import až při volání
+    import requests
     url = f"{BINANCE_BASE_URL}{path}"
     if signed:
         if not BINANCE_API_KEY or not BINANCE_API_SECRET:
@@ -134,6 +137,9 @@ def binance_post(path: str, params: Dict, signed: bool = True):
         params["timestamp"] = _ts_ms()
         params["recvWindow"] = 5000
         params["signature"] = _sign(params, BINANCE_API_SECRET)
+
+    logger.info("[BINANCE][POST] %s params=%s", url, params)
+
     r = requests.post(url, data=params, headers=_headers(), timeout=20)
     if r.status_code in (200, 201):
         return r.json()
@@ -163,7 +169,7 @@ def symbol_filters(info: Dict) -> Dict[str, float]:
         "minNotional": float(min_notional.get("minNotional", "0.0"))
     }
 
-# ------------------ CTX: storage klienti až v main() ------------------
+# ------------------ CTX ------------------
 
 class Ctx:
     def __init__(self, blob_service, signals_cc, trades_cc, state_cc):
@@ -172,7 +178,7 @@ class Ctx:
         self.trades_cc = trades_cc
         self.state_cc = state_cc
 
-# ------------------ STORAGE HELPERS (používají Ctx) ------------------
+# ------------------ STORAGE HELPERS ------------------
 
 def _state_blob_name(pair: str, model: str) -> str:
     return f"{pair}_{model}.json"
@@ -185,7 +191,7 @@ def load_state(ctx: Ctx, pair: str, model: str) -> Dict:
         return json.loads(data.decode("utf-8"))
     except ResourceNotFoundError:
         return {
-            "position": "flat",  # flat|long|short
+            "position": "flat",
             "qty": 0.0,
             "avg_price": 0.0,
             "last_order_id": None,
@@ -232,7 +238,7 @@ def append_trade(ctx: Ctx, pair: str, row: Dict):
     ]) + "\n"
     append_client.append_block(line.encode("utf-8"))
 
-# ------------------ SIGNALS (B/S) ------------------
+# ------------------ SIGNALS ------------------
 
 def _min_cycles_for(pair: str) -> int:
     return int(OVR_CYCLES.get(pair.upper(), float(MIN_CYCLES_GLOBAL)))
@@ -241,9 +247,8 @@ def _min_score_for(pair: str) -> float:
     return float(OVR_SCORE.get(pair.upper(), float(MIN_SCORE_GLOBAL)))
 
 def load_active_signal(ctx: Ctx, pair: str, model: str) -> Optional[Dict]:
-    """Vrátí dict s B,S pro nejnovější aktivní řádek splňující prahy nebo None."""
     try:
-        import pandas as pd  # import až tady
+        import pandas as pd
     except Exception as ie:
         logger.error("[signals] pandas import failed: %s", ie)
         return None
@@ -290,31 +295,25 @@ def load_active_signal(ctx: Ctx, pair: str, model: str) -> Optional[Dict]:
         "load_time_utc": row["load_time_utc"].strftime("%Y-%m-%dT%H:%M:%SZ") if pd.notna(row["load_time_utc"]) else None
     }
 
-# ------------------ TRADING LOGIC (long-only default) ------------------
+# ------------------ TRADING LOGIC ------------------
 
 def trade_tick(ctx: Ctx, pair: str, model: str):
     start = time.time()
-
     sig = load_active_signal(ctx, pair, model)
     if not sig:
         logger.info("[%s] No active signal passing thresholds — skipping.", pair)
         return
 
     B = sig["B"]; S = sig["S"]
-
     st = load_state(ctx, pair, model)
     st["B"] = B; st["S"] = S
     st["session_tag"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     save_state(ctx, pair, model, st)
 
-    # Exchange constraints
     info = get_exchange_info(pair)
     filt = symbol_filters(info)
-
-    # Current price
     price = get_price(pair)
 
-    # Decision
     if st["position"] == "flat":
         if price <= B:
             params = {
@@ -406,62 +405,4 @@ def trade_tick(ctx: Ctx, pair: str, model: str):
                 "side": "SELL",
                 "qty": float(resp.get("executedQty", qty_to_sell)),
                 "avg_price": avg_price,
-                "quote_usdt": float(resp.get("cummulativeQuoteQty", 0.0)),
-                "fee": fee,
-                "fee_asset": fee_asset,
-                "order_id": resp.get("orderId"),
-                "b_level": B,
-                "s_level": S,
-                "pnl_pct_since_open": pnl_pct
-            })
-            logger.info("[%s] SELL filled qty=%.8f @ %.8f pnl=%.3f%%", pair, qty_to_sell, avg_price, pnl_pct)
-
-    dt = time.time() - start
-    logger.info("[%s] tick finished in %.2fs @ price=%.8f B=%.8f S=%.8f", pair, dt, price, B, S)
-
-# ------------------ ENTRYPOINT ------------------
-
-def main(mytimer: func.TimerRequest) -> None:
-    try:
-        start = time.time()
-        now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        logger.info("[BinanceTradeBot] Tick %s — pairs=%d", now_utc, len(PAIRS_MODELS))
-
-        if not PAIRS_MODELS:
-            logger.error("PAIRS_MODELS is empty. Set e.g. 'XRPUSDT:BS_MedianScore,BTCUSDT:BS_MedianScore'.")
-            return
-
-        # Lazy init storage až teď (žádné I/O na modulu)
-        from azure.storage.blob import BlobServiceClient
-        from azure.core.exceptions import ResourceExistsError
-
-        if not WEBJOBS_CONN:
-            logger.error("AzureWebJobsStorage is not set.")
-            return
-
-        blob_service = BlobServiceClient.from_connection_string(WEBJOBS_CONN)
-        signals_cc = blob_service.get_container_client(SIGNALS_CONTAINER)
-        trades_cc  = blob_service.get_container_client(TRADES_CONTAINER)
-        state_cc   = blob_service.get_container_client(STATE_CONTAINER)
-
-        for cc in (signals_cc, trades_cc, state_cc):
-            try:
-                cc.create_container()
-            except ResourceExistsError:
-                pass
-
-        ctx = Ctx(blob_service, signals_cc, trades_cc, state_cc)
-
-        for (pair, model) in PAIRS_MODELS:
-            try:
-                trade_tick(ctx, pair, model)
-            except Exception:
-                logger.exception("[%s] tick error", pair)
-
-            if time.time() - start > TIMEOUT_SEC_PER_TICK:
-                logger.warning("TIMEOUT_SEC_PER_TICK reached; stopping this tick early.")
-                break
-
-    except Exception:
-        logger.exception("[BinanceTradeBot] Unhandled exception in main()")
-        raise
+                "quote_usdt": float
