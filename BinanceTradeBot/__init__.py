@@ -9,9 +9,7 @@ import urllib.parse
 from datetime import datetime, timezone
 from typing import Optional
 
-import azure.functions as func
-import pandas as pd
-import requests
+import azure.functions as func  # lehký import, bývá vždy dostupný
 
 # ------------------ ENV & CONFIG ------------------
 
@@ -78,8 +76,8 @@ TIMEOUT_SEC_PER_TICK = _get_int("TIMEOUT_SEC_PER_TICK", 20)
 # Pairs (jen env parse)
 PAIRS_MODELS = _parse_pairs_models(os.getenv("PAIRS_MODELS", ""))
 
-# Storage (jen názvy; klienta vytvoříme až v main)
-WEBJOBS_CONN      = _get_env("AzureWebJobsStorage", None)  # nepoužíváme required=True na modulu
+# Storage (jen názvy; klienty vytvoříme až v main)
+WEBJOBS_CONN      = _get_env("AzureWebJobsStorage", None)  # ne required=True na modulu
 SIGNALS_CONTAINER = _get_env("SIGNALS_CONTAINER", "market-signals")
 MASTER_CSV_NAME   = _get_env("MASTER_CSV_NAME", "bs_levels_master.csv")
 TRADES_CONTAINER  = _get_env("TRADES_CONTAINER", "trade-logs")
@@ -89,7 +87,7 @@ logger = logging.getLogger("BinanceTradeBot")
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
 
-# ------------------ BINANCE REST (bez I/O při importu) ------------------
+# ------------------ BINANCE REST (imports uvnitř funkcí) ------------------
 
 def _ts_ms() -> int:
     return int(time.time() * 1000)
@@ -102,6 +100,7 @@ def _headers() -> dict:
     return {"X-MBX-APIKEY": BINANCE_API_KEY, "Content-Type": "application/x-www-form-urlencoded"}
 
 def binance_get(path: str, params: Optional[dict] = None, signed: bool = False):
+    import requests  # import až při volání
     url = f"{BINANCE_BASE_URL}{path}"
     params = params or {}
     if signed:
@@ -116,6 +115,7 @@ def binance_get(path: str, params: Optional[dict] = None, signed: bool = False):
     raise RuntimeError(f"GET {path} {r.status_code}: {r.text[:200]}")
 
 def binance_post(path: str, params: dict, signed: bool = True):
+    import requests  # import až při volání
     url = f"{BINANCE_BASE_URL}{path}"
     if signed:
         if not BINANCE_API_KEY or not BINANCE_API_SECRET:
@@ -231,6 +231,13 @@ def _min_score_for(pair: str) -> float:
 
 def load_active_signal(ctx: Ctx, pair: str, model: str) -> Optional[dict]:
     """Vrátí dict s B,S pro nejnovější aktivní řádek splňující prahy nebo None."""
+    # Import pandas až tady, aby import-time error nepoložil celý modul:
+    try:
+        import pandas as pd
+    except Exception as ie:
+        logger.error("[signals] pandas import failed: %s", ie)
+        return None
+
     from azure.core.exceptions import ResourceNotFoundError
     blob = ctx.signals_cc.get_blob_client(MASTER_CSV_NAME)
     try:
@@ -239,7 +246,12 @@ def load_active_signal(ctx: Ctx, pair: str, model: str) -> Optional[dict]:
         logger.warning(f"Master CSV '{MASTER_CSV_NAME}' not found in {ctx.signals_cc.container_name}.")
         return None
 
-    df = pd.read_csv(pd.io.common.BytesIO(data))
+    try:
+        df = pd.read_csv(pd.io.common.BytesIO(data))
+    except Exception as ie:
+        logger.exception("[signals] Failed to read master CSV via pandas")
+        return None
+
     need_cols = {"pair","model","is_active","B","S","total_cycles","score","date","load_time_utc"}
     if not need_cols.issubset(df.columns):
         logger.warning(f"Master CSV missing required columns. Have: {df.columns.tolist()}")
@@ -407,7 +419,7 @@ def main(mytimer: func.TimerRequest) -> None:
             logger.error("PAIRS_MODELS is empty. Set e.g. 'XRPUSDT:BS_MedianScore,BTCUSDT:BS_MedianScore'.")
             return
 
-        # Lazy import & init storage až tady (žádné I/O na modulu)
+        # Azure Storage klienty vytvoříme až tady
         from azure.storage.blob import BlobServiceClient
         from azure.core.exceptions import ResourceExistsError
 
@@ -440,5 +452,4 @@ def main(mytimer: func.TimerRequest) -> None:
 
     except Exception:
         logger.exception("[BinanceTradeBot] Unhandled exception in main()")
-        # rethrow necháme, aby se v Portálu korektně ukázalo Failed s tracebackem
         raise
