@@ -56,9 +56,9 @@ jobs:
       - name: Login to Azure
         uses: azure/login@v2
         with:
-          client-id: ${{ secrets.REPLACE_WITH_YOUR_AZURE_CLIENT_ID_SECRET_NAME }}
-          tenant-id: ${{ secrets.REPLACE_WITH_YOUR_AZURE_TENANT_ID_SECRET_NAME }}
-          subscription-id: ${{ secrets.REPLACE_WITH_YOUR_AZURE_SUBSCRIPTION_ID_SECRET_NAME }}
+          client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_69E5CE2EDA7C4175BFCE5A3FBE71761F }}
+          tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_B896266DBCF74093BD42E8A951B15627 }}
+          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_6986CDF3F45C426181635AD63931D50E }}
 
       - name: Deploy to Azure Functions
         uses: Azure/functions-action@v1
@@ -66,3 +66,4 @@ jobs:
           app-name: 'BinanceTradeBot'        # přesný název tvé Function App
           slot-name: 'Production'
           package: 'release.zip'              # posíláme ZIP, ne adresář
+
