@@ -7,9 +7,9 @@ import hashlib
 import logging
 import urllib.parse
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, List, Tuple, Dict
 
-import azure.functions as func  # lehký import, bývá vždy dostupný
+import azure.functions as func  # lehký import
 
 # ------------------ ENV & CONFIG ------------------
 
@@ -21,30 +21,41 @@ def _get_env(name: str, default: Optional[str] = None, required: bool = False) -
 
 def _get_int(name: str, default: int) -> int:
     v = os.getenv(name)
-    try: return int(v) if v is not None else default
-    except: return default
+    try:
+        return int(v) if v is not None else default
+    except:
+        return default
 
 def _get_float(name: str, default: float) -> float:
     v = os.getenv(name)
-    try: return float(v) if v is not None else default
-    except: return default
+    try:
+        return float(v) if v is not None else default
+    except:
+        return default
 
-def _parse_pairs_models(val: str):
-    """PAIRS_MODELS='XRPUSDT:BS_MedianScore,BTCUSDT:BS_MedianScore' -> [(pair, model), ...]"""
-    res = []
-    if not val: return res
+def _parse_pairs_models(val: str) -> List[Tuple[str, str]]:
+    """
+    PAIRS_MODELS='XRPUSDT:BS_MedianScore,BTCUSDT:BS_MedianScore'
+    -> [('XRPUSDT','BS_MedianScore'), ('BTCUSDT','BS_MedianScore')]
+    """
+    res: List[Tuple[str, str]] = []
+    if not val:
+        return res
     for piece in val.split(","):
         piece = piece.strip()
-        if not piece or ":" not in piece: 
+        if not piece or ":" not in piece:
             continue
         pair, model = piece.split(":", 1)
         res.append((pair.strip().upper(), model.strip()))
     return res
 
-def _parse_overrides(env_val: str) -> dict:
-    """'XRPUSDT:4,TRXUSDT:2' -> {'XRPUSDT':4, 'TRXUSDT':2}"""
-    out = {}
-    if not env_val: return out
+def _parse_overrides(env_val: str) -> Dict[str, float]:
+    """
+    'XRPUSDT:4,TRXUSDT:2' -> {'XRPUSDT':4.0, 'TRXUSDT':2.0}
+    """
+    out: Dict[str, float] = {}
+    if not env_val:
+        return out
     for piece in env_val.split(","):
         piece = piece.strip()
         if not piece or ":" not in piece:
@@ -57,7 +68,7 @@ def _parse_overrides(env_val: str) -> dict:
             continue
     return out
 
-# Strategy thresholds (jen čtení hodnot; žádné I/O)
+# Strategy thresholds
 MIN_CYCLES_GLOBAL = _get_int("MIN_CYCLES_PER_DAY", 3)
 MIN_SCORE_GLOBAL  = _get_float("MIN_SCORE", 0.001)
 OVR_CYCLES = _parse_overrides(os.getenv("MIN_CYCLES_PER_DAY_OVERRIDES", ""))
@@ -92,14 +103,14 @@ if not logger.handlers:
 def _ts_ms() -> int:
     return int(time.time() * 1000)
 
-def _sign(params: dict, secret: str) -> str:
+def _sign(params: Dict, secret: str) -> str:
     qs = urllib.parse.urlencode(params, doseq=True)
     return hmac.new(secret.encode("utf-8"), qs.encode("utf-8"), hashlib.sha256).hexdigest()
 
-def _headers() -> dict:
-    return {"X-MBX-APIKEY": BINANCE_API_KEY, "Content-Type": "application/x-www-form-urlencoded"}
+def _headers() -> Dict[str, str]:
+    return {"X-MBX-APIKEY": BINANCE_API_KEY or "", "Content-Type": "application/x-www-form-urlencoded"}
 
-def binance_get(path: str, params: Optional[dict] = None, signed: bool = False):
+def binance_get(path: str, params: Optional[Dict] = None, signed: bool = False):
     import requests  # import až při volání
     url = f"{BINANCE_BASE_URL}{path}"
     params = params or {}
@@ -112,9 +123,9 @@ def binance_get(path: str, params: Optional[dict] = None, signed: bool = False):
     r = requests.get(url, params=params, headers=_headers(), timeout=20)
     if r.status_code == 200:
         return r.json()
-    raise RuntimeError(f"GET {path} {r.status_code}: {r.text[:200]}")
+    raise RuntimeError("GET {0} {1}: {2}".format(path, r.status_code, r.text[:200]))
 
-def binance_post(path: str, params: dict, signed: bool = True):
+def binance_post(path: str, params: Dict, signed: bool = True):
     import requests  # import až při volání
     url = f"{BINANCE_BASE_URL}{path}"
     if signed:
@@ -126,22 +137,22 @@ def binance_post(path: str, params: dict, signed: bool = True):
     r = requests.post(url, data=params, headers=_headers(), timeout=20)
     if r.status_code in (200, 201):
         return r.json()
-    raise RuntimeError(f"POST {path} {r.status_code}: {r.text[:200]}")
+    raise RuntimeError("POST {0} {1}: {2}".format(path, r.status_code, r.text[:200]))
 
 def get_price(pair: str) -> float:
     data = binance_get("/api/v3/ticker/price", {"symbol": pair})
     return float(data["price"])
 
-def get_exchange_info(pair: str) -> dict:
+def get_exchange_info(pair: str) -> Dict:
     data = binance_get("/api/v3/exchangeInfo", {"symbol": pair})
     return data
 
 def round_step(value: float, step: float) -> float:
-    if step <= 0: 
+    if step <= 0:
         return value
     return math.floor(value / step) * step
 
-def symbol_filters(info: dict) -> dict:
+def symbol_filters(info: Dict) -> Dict[str, float]:
     filters = {f["filterType"]: f for f in info["symbols"][0]["filters"]}
     lot = filters.get("LOT_SIZE", {})
     price = filters.get("PRICE_FILTER", {})
@@ -166,7 +177,7 @@ class Ctx:
 def _state_blob_name(pair: str, model: str) -> str:
     return f"{pair}_{model}.json"
 
-def load_state(ctx: Ctx, pair: str, model: str) -> dict:
+def load_state(ctx: Ctx, pair: str, model: str) -> Dict:
     from azure.core.exceptions import ResourceNotFoundError
     blob = ctx.state_cc.get_blob_client(_state_blob_name(pair, model))
     try:
@@ -183,7 +194,7 @@ def load_state(ctx: Ctx, pair: str, model: str) -> dict:
             "session_tag": None
         }
 
-def save_state(ctx: Ctx, pair: str, model: str, state: dict):
+def save_state(ctx: Ctx, pair: str, model: str, state: Dict):
     blob = ctx.state_cc.get_blob_client(_state_blob_name(pair, model))
     data = json.dumps(state, separators=(",", ":")).encode("utf-8")
     blob.upload_blob(data, overwrite=True)
@@ -200,7 +211,7 @@ def ensure_trades_csv(ctx: Ctx, pair: str):
     except ResourceExistsError:
         pass
 
-def append_trade(ctx: Ctx, pair: str, row: dict):
+def append_trade(ctx: Ctx, pair: str, row: Dict):
     ensure_trades_csv(ctx, pair)
     blob = ctx.trades_cc.get_blob_client(f"{pair}_trades.csv")
     append_client = blob.as_append_blob_client()
@@ -209,31 +220,30 @@ def append_trade(ctx: Ctx, pair: str, row: dict):
         row.get("model",""),
         row.get("pair",""),
         row.get("side",""),
-        f"{row.get('qty',0):.8f}",
-        f"{row.get('avg_price',0):.8f}",
-        f"{row.get('quote_usdt',0):.8f}",
-        f"{row.get('fee',0):.8f}",
+        "{0:.8f}".format(row.get("qty",0.0)),
+        "{0:.8f}".format(row.get("avg_price",0.0)),
+        "{0:.8f}".format(row.get("quote_usdt",0.0)),
+        "{0:.8f}".format(row.get("fee",0.0)),
         row.get("fee_asset",""),
         str(row.get("order_id","")),
-        f"{row.get('b_level',0):.8f}",
-        f"{row.get('s_level',0):.8f}",
-        f"{row.get('pnl_pct_since_open',0):.6f}"
+        "{0:.8f}".format(row.get("b_level",0.0)),
+        "{0:.8f}".format(row.get("s_level",0.0)),
+        "{0:.6f}".format(row.get("pnl_pct_since_open",0.0))
     ]) + "\n"
     append_client.append_block(line.encode("utf-8"))
 
 # ------------------ SIGNALS (B/S) ------------------
 
 def _min_cycles_for(pair: str) -> int:
-    return int(OVR_CYCLES.get(pair.upper(), MIN_CYCLES_GLOBAL))
+    return int(OVR_CYCLES.get(pair.upper(), float(MIN_CYCLES_GLOBAL)))
 
 def _min_score_for(pair: str) -> float:
-    return float(OVR_SCORE.get(pair.upper(), MIN_SCORE_GLOBAL))
+    return float(OVR_SCORE.get(pair.upper(), float(MIN_SCORE_GLOBAL)))
 
-def load_active_signal(ctx: Ctx, pair: str, model: str) -> Optional[dict]:
+def load_active_signal(ctx: Ctx, pair: str, model: str) -> Optional[Dict]:
     """Vrátí dict s B,S pro nejnovější aktivní řádek splňující prahy nebo None."""
-    # Import pandas až tady, aby import-time error nepoložil celý modul:
     try:
-        import pandas as pd
+        import pandas as pd  # import až tady
     except Exception as ie:
         logger.error("[signals] pandas import failed: %s", ie)
         return None
@@ -243,18 +253,18 @@ def load_active_signal(ctx: Ctx, pair: str, model: str) -> Optional[dict]:
     try:
         data = blob.download_blob().readall()
     except ResourceNotFoundError:
-        logger.warning(f"Master CSV '{MASTER_CSV_NAME}' not found in {ctx.signals_cc.container_name}.")
+        logger.warning("Master CSV '%s' not found in %s.", MASTER_CSV_NAME, ctx.signals_cc.container_name)
         return None
 
     try:
         df = pd.read_csv(pd.io.common.BytesIO(data))
-    except Exception as ie:
+    except Exception:
         logger.exception("[signals] Failed to read master CSV via pandas")
         return None
 
     need_cols = {"pair","model","is_active","B","S","total_cycles","score","date","load_time_utc"}
     if not need_cols.issubset(df.columns):
-        logger.warning(f"Master CSV missing required columns. Have: {df.columns.tolist()}")
+        logger.warning("Master CSV missing required columns. Have: %s", df.columns.tolist())
         return None
 
     f = df[
@@ -287,7 +297,7 @@ def trade_tick(ctx: Ctx, pair: str, model: str):
 
     sig = load_active_signal(ctx, pair, model)
     if not sig:
-        logger.info(f"[{pair}] No active signal passing thresholds — skipping.")
+        logger.info("[%s] No active signal passing thresholds — skipping.", pair)
         return
 
     B = sig["B"]; S = sig["S"]
@@ -311,7 +321,7 @@ def trade_tick(ctx: Ctx, pair: str, model: str):
                 "symbol": pair,
                 "side": "BUY",
                 "type": "MARKET",
-                "quoteOrderQty": f"{TRADE_USDT_PER_ORDER:.2f}"
+                "quoteOrderQty": "{0:.2f}".format(TRADE_USDT_PER_ORDER)
             }
             resp = binance_post("/api/v3/order", params)
             fills = resp.get("fills", [])
@@ -324,7 +334,8 @@ def trade_tick(ctx: Ctx, pair: str, model: str):
                 qty = total_qty
             else:
                 qty = float(resp.get("executedQty", 0))
-                avg_price = float(resp.get("cummulativeQuoteQty", 0)) / max(qty or 1e-12, 1e-12)
+                cq = float(resp.get("cummulativeQuoteQty", 0.0))
+                avg_price = cq / (qty or 1e-12)
                 fee = 0.0; fee_asset = QUOTE_ASSET
 
             st["position"] = "long"
@@ -349,20 +360,20 @@ def trade_tick(ctx: Ctx, pair: str, model: str):
                 "s_level": S,
                 "pnl_pct_since_open": 0.0
             })
-            logger.info(f"[{pair}] BUY filled qty={qty:.8f} @ {avg_price:.8f} USDT={TRADE_USDT_PER_ORDER:.2f}")
+            logger.info("[%s] BUY filled qty=%.8f @ %.8f USDT=%.2f", pair, qty, avg_price, TRADE_USDT_PER_ORDER)
 
     elif st["position"] == "long":
         if price >= S:
             qty_to_sell = round_step(float(st.get("qty", 0.0)), filt["stepSize"])
             if qty_to_sell <= 0:
-                logger.warning(f"[{pair}] qty_to_sell <= 0, resetting to flat.")
+                logger.warning("[%s] qty_to_sell <= 0, resetting to flat.", pair)
                 st["position"] = "flat"; st["qty"] = 0.0; save_state(ctx, pair, model, st); return
 
             params = {
                 "symbol": pair,
                 "side": "SELL",
                 "type": "MARKET",
-                "quantity": f"{qty_to_sell:.8f}"
+                "quantity": "{0:.8f}".format(qty_to_sell)
             }
             resp = binance_post("/api/v3/order", params)
             fills = resp.get("fills", [])
@@ -374,11 +385,12 @@ def trade_tick(ctx: Ctx, pair: str, model: str):
                 fee_asset = fills[0].get("commissionAsset", QUOTE_ASSET)
             else:
                 total_qty = float(resp.get("executedQty", qty_to_sell))
-                avg_price = float(resp.get("cummulativeQuoteQty", 0)) / max(total_qty or 1e-12, 1e-12)
+                cq = float(resp.get("cummulativeQuoteQty", 0.0))
+                avg_price = cq / (total_qty or 1e-12)
                 fee = 0.0; fee_asset = QUOTE_ASSET
 
             buy_px = float(st.get("avg_price", avg_price))
-            pnl_pct = ((avg_price - buy_px) / buy_px) * 100.0
+            pnl_pct = ((avg_price - buy_px) / (buy_px or 1e-12)) * 100.0
 
             st["position"] = "flat"
             st["qty"] = 0.0
@@ -402,10 +414,10 @@ def trade_tick(ctx: Ctx, pair: str, model: str):
                 "s_level": S,
                 "pnl_pct_since_open": pnl_pct
             })
-            logger.info(f"[{pair}] SELL filled qty={qty_to_sell:.8f} @ {avg_price:.8f} pnl={pnl_pct:.3f}%")
+            logger.info("[%s] SELL filled qty=%.8f @ %.8f pnl=%.3f%%", pair, qty_to_sell, avg_price, pnl_pct)
 
     dt = time.time() - start
-    logger.info(f"[{pair}] tick finished in {dt:.2f}s @ price={price:.8f} B={B:.8f} S={S:.8f}")
+    logger.info("[%s] tick finished in %.2fs @ price=%.8f B=%.8f S=%.8f", pair, dt, price, B, S)
 
 # ------------------ ENTRYPOINT ------------------
 
@@ -413,13 +425,13 @@ def main(mytimer: func.TimerRequest) -> None:
     try:
         start = time.time()
         now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        logger.info(f"[BinanceTradeBot] Tick {now_utc} — pairs={len(PAIRS_MODELS)}")
+        logger.info("[BinanceTradeBot] Tick %s — pairs=%d", now_utc, len(PAIRS_MODELS))
 
         if not PAIRS_MODELS:
             logger.error("PAIRS_MODELS is empty. Set e.g. 'XRPUSDT:BS_MedianScore,BTCUSDT:BS_MedianScore'.")
             return
 
-        # Azure Storage klienty vytvoříme až tady
+        # Lazy init storage až teď (žádné I/O na modulu)
         from azure.storage.blob import BlobServiceClient
         from azure.core.exceptions import ResourceExistsError
 
@@ -444,7 +456,7 @@ def main(mytimer: func.TimerRequest) -> None:
             try:
                 trade_tick(ctx, pair, model)
             except Exception:
-                logger.exception(f"[{pair}] tick error")
+                logger.exception("[%s] tick error", pair)
 
             if time.time() - start > TIMEOUT_SEC_PER_TICK:
                 logger.warning("TIMEOUT_SEC_PER_TICK reached; stopping this tick early.")
