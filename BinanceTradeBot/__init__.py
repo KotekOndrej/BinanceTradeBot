@@ -11,8 +11,8 @@ from typing import Optional, List, Tuple, Dict
 
 import azure.functions as func  # lehký import
 
-# ---- Azure Blob SDK ----
-from azure.storage.blob import BlobServiceClient, ContainerClient, BlobClient, AppendBlobClient
+# ---- Azure Blob SDK (jen univerzální klienti) ----
+from azure.storage.blob import BlobServiceClient, ContainerClient, BlobClient
 from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
 
 # ------------------ ENV & CONFIG ------------------
@@ -54,9 +54,6 @@ def _parse_pairs_models(val: str) -> List[Tuple[str, str]]:
     return res
 
 def _parse_overrides(env_val: str) -> Dict[str, float]:
-    """
-    'XRPUSDT:4,TRXUSDT:2' -> {'XRPUSDT':4.0, 'TRXUSDT':2.0}
-    """
     out: Dict[str, float] = {}
     if not env_val:
         return out
@@ -88,10 +85,10 @@ TRADE_USDT_PER_ORDER = _get_float("TRADE_USDT_PER_ORDER", 50.0)
 ALLOW_SHORT = os.getenv("ALLOW_SHORT", "false").lower() == "true"
 TIMEOUT_SEC_PER_TICK = _get_int("TIMEOUT_SEC_PER_TICK", 20)
 
-# Pairs (jen env parse)
+# Pairs
 PAIRS_MODELS = _parse_pairs_models(os.getenv("PAIRS_MODELS", ""))
 
-# Storage (jen názvy; klienty vytvoříme až v main)
+# Storage
 WEBJOBS_CONN      = _get_env("AzureWebJobsStorage", None)
 SIGNALS_CONTAINER = _get_env("SIGNALS_CONTAINER", "market-signals")
 MASTER_CSV_NAME   = _get_env("MASTER_CSV_NAME", "bs_levels_master.csv")
@@ -114,65 +111,72 @@ def _sign(params: Dict, secret: str) -> str:
 def _headers() -> Dict[str, str]:
     return {"X-MBX-APIKEY": BINANCE_API_KEY or "", "Content-Type": "application/x-www-form-urlencoded"}
 
-# ---------- API CALL FILE LOGGING (to trade-logs, AppendBlobClient) ----------
+# ---------- Block Blob helpers (bez AppendBlob závislosti) ----------
+
+def _put_full_body_as_single_block(blob: BlobClient, data_bytes: bytes):
+    """
+    Přepíše celé tělo blobu jediným blokem (kompatibilní se všemi verzemi SDK).
+    """
+    import base64, secrets
+    block_id = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
+    # stage + commit se seznamem ID jako list[str]
+    blob.stage_block(block_id=block_id, data=data_bytes)
+    blob.commit_block_list([block_id])
+
+def _ensure_blob_with_header(blob: BlobClient, header_line: str):
+    """
+    Pokud blob neexistuje → vytvoř s hlavičkou.
+    Pokud existuje a nemá hlavičku → doplň ji před obsah.
+    """
+    try:
+        props = blob.get_blob_properties()
+        size = props.size or 0
+        if size == 0:
+            _put_full_body_as_single_block(blob, (header_line + "\n").encode("utf-8"))
+            return
+        head = blob.download_blob(offset=0, length=256).readall().decode("utf-8", "ignore")
+        if not head.startswith(header_line):
+            existing = blob.download_blob().readall()
+            new_body = (header_line + "\n").encode("utf-8") + existing
+            _put_full_body_as_single_block(blob, new_body)
+    except ResourceNotFoundError:
+        _put_full_body_as_single_block(blob, (header_line + "\n").encode("utf-8"))
+
+def _append_lines_block_blob(blob: BlobClient, new_text: str):
+    """
+    Připojí text (řádky) na konec block blobu: stáhne existující obsah, přidá nové řádky,
+    a celé tělo uloží jedním blokem. Jednoduché a kompatibilní.
+    """
+    try:
+        existing = b""
+        try:
+            props = blob.get_blob_properties()
+            if (props.size or 0) > 0:
+                existing = blob.download_blob().readall()
+        except ResourceNotFoundError:
+            existing = b""
+        combined = existing + new_text.encode("utf-8")
+        _put_full_body_as_single_block(blob, combined)
+    except Exception as e:
+        logger.error("[blob-append] failed for %s: %s", blob.blob_name, e, exc_info=True)
+        raise
+
+# ---------- API CALL FILE LOGGING (to trade-logs, Block Blob) ----------
 
 _API_LOG_CACHE = {
-    "svc": None,            # BlobServiceClient
-    "cc": None,             # ContainerClient (trade-logs)
-    "blob_name": None,      # current api_calls_YYYY-MM-DD.csv
-    "append_client": None,  # AppendBlobClient
-    "header_written": False,
+    "svc": None,   # BlobServiceClient
+    "cc": None,    # ContainerClient (trade-logs)
 }
 
 def _api_log_blob_name() -> str:
     d = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     return f"api_calls_{d}.csv"
 
-def _get_append_client(container_name: str, blob_name: str) -> AppendBlobClient:
-    return AppendBlobClient.from_connection_string(
-        conn_str=WEBJOBS_CONN,
-        container_name=container_name,
-        blob_name=blob_name,
-    )
-
-def _get_api_log_append_client():
-    current_name = _api_log_blob_name()
-    if _API_LOG_CACHE["append_client"] is not None and _API_LOG_CACHE["blob_name"] == current_name:
-        return _API_LOG_CACHE["append_client"]
-
-    if not WEBJOBS_CONN:
-        return None
-
-    if _API_LOG_CACHE["svc"] is None:
-        _API_LOG_CACHE["svc"] = BlobServiceClient.from_connection_string(WEBJOBS_CONN)
-    if _API_LOG_CACHE["cc"] is None:
-        cc = _API_LOG_CACHE["svc"].get_container_client(TRADES_CONTAINER)
-        try:
-            cc.create_container()
-        except ResourceExistsError:
-            pass
-        _API_LOG_CACHE["cc"] = cc
-
-    trades_cc: ContainerClient = _API_LOG_CACHE["cc"]
-    append_client = _get_append_client(trades_cc.container_name, current_name)
-    header = "time_utc,method,path,params_json,status,duration_ms,error\n"
-    try:
-        append_client.create_append_blob()
-        append_client.append_block(header.encode("utf-8"))
-    except ResourceExistsError:
-        # ověř hlavičku
-        blob = trades_cc.get_blob_client(current_name)
-        try:
-            chunk = blob.download_blob(offset=0, length=64).readall().decode("utf-8", "ignore")
-            if not chunk.startswith(header.rstrip("\n")):
-                append_client.append_block(header.encode("utf-8"))
-        except Exception:
-            append_client.append_block(header.encode("utf-8"))
-
-    _API_LOG_CACHE["append_client"] = append_client
-    _API_LOG_CACHE["blob_name"] = current_name
-    _API_LOG_CACHE["header_written"] = True
-    return append_client
+def _get_api_log_blob(trades_cc: ContainerClient) -> BlobClient:
+    name = _api_log_blob_name()
+    blob = trades_cc.get_blob_client(name)
+    _ensure_blob_with_header(blob, "time_utc,method,path,params_json,status,duration_ms,error")
+    return blob
 
 def _redact_params(p: Dict) -> Dict:
     if not p:
@@ -182,22 +186,19 @@ def _redact_params(p: Dict) -> Dict:
         red["signature"] = "<redacted>"
     return red
 
-def _append_api_call(method: str, path: str, params: Dict, status: int, duration_ms: int, error: Optional[str] = None):
+def _append_api_call(trades_cc: ContainerClient, method: str, path: str, params: Dict, status: int, duration_ms: int, error: Optional[str] = None):
     try:
-        ac = _get_api_log_append_client()
-        if ac is None:
-            return
+        blob = _get_api_log_blob(trades_cc)
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         params_json = json.dumps(_redact_params(params or {}), separators=(",", ":"), ensure_ascii=False)
         line = f"{now},{method},{path},{params_json},{status},{duration_ms},{'' if not error else error.replace(',', ';')}\n"
-        ac.append_block(line.encode("utf-8"))
+        _append_lines_block_blob(blob, line)
     except Exception:
-        # Log nesmí blokovat obchodování
         logger.error("[api-log] failed to append api call", exc_info=True)
 
 # ---------- REST GET/POST s file-loggingem ----------
 
-def binance_get(path: str, params: Optional[Dict] = None, signed: bool = False):
+def binance_get(path: str, params: Optional[Dict] = None, signed: bool = False, trades_cc: ContainerClient = None):
     import requests
     url = f"{BINANCE_BASE_URL}{path}"
     params = params or {}
@@ -212,16 +213,18 @@ def binance_get(path: str, params: Optional[Dict] = None, signed: bool = False):
     try:
         r = requests.get(url, params=params, headers=_headers(), timeout=20)
         dur = int((time.time() - t0) * 1000)
-        _append_api_call("GET", path, params, r.status_code, dur, None if r.status_code == 200 else r.text[:120])
+        if trades_cc is not None:
+            _append_api_call(trades_cc, "GET", path, params, r.status_code, dur, None if r.status_code == 200 else r.text[:120])
         if r.status_code == 200:
             return r.json()
         raise RuntimeError("GET {0} {1}: {2}".format(path, r.status_code, r.text[:200]))
     except Exception as e:
         dur = int((time.time() - t0) * 1000)
-        _append_api_call("GET", path, params, -1, dur, str(e)[:120])
+        if trades_cc is not None:
+            _append_api_call(trades_cc, "GET", path, params, -1, dur, str(e)[:120])
         raise
 
-def binance_post(path: str, params: Dict, signed: bool = True):
+def binance_post(path: str, params: Dict, signed: bool = True, trades_cc: ContainerClient = None):
     import requests
     url = f"{BINANCE_BASE_URL}{path}"
     if signed:
@@ -236,21 +239,23 @@ def binance_post(path: str, params: Dict, signed: bool = True):
     try:
         r = requests.post(url, data=params, headers=_headers(), timeout=20)
         dur = int((time.time() - t0) * 1000)
-        _append_api_call("POST", path, params, r.status_code, dur, None if r.status_code in (200, 201) else r.text[:120])
+        if trades_cc is not None:
+            _append_api_call(trades_cc, "POST", path, params, r.status_code, dur, None if r.status_code in (200, 201) else r.text[:120])
         if r.status_code in (200, 201):
             return r.json()
         raise RuntimeError("POST {0} {1}: {2}".format(path, r.status_code, r.text[:200]))
     except Exception as e:
         dur = int((time.time() - t0) * 1000)
-        _append_api_call("POST", path, params, -1, dur, str(e)[:120])
+        if trades_cc is not None:
+            _append_api_call(trades_cc, "POST", path, params, -1, dur, str(e)[:120])
         raise
 
-def get_price(pair: str) -> float:
-    data = binance_get("/api/v3/ticker/price", {"symbol": pair})
+def get_price(pair: str, trades_cc: ContainerClient) -> float:
+    data = binance_get("/api/v3/ticker/price", {"symbol": pair}, trades_cc=trades_cc)
     return float(data["price"])
 
-def get_exchange_info(pair: str) -> Dict:
-    data = binance_get("/api/v3/exchangeInfo", {"symbol": pair})
+def get_exchange_info(pair: str, trades_cc: ContainerClient) -> Dict:
+    data = binance_get("/api/v3/exchangeInfo", {"symbol": pair}, trades_cc=trades_cc)
     return data
 
 def round_step(value: float, step: float) -> float:
@@ -304,35 +309,17 @@ def save_state(ctx: Ctx, pair: str, model: str, state: Dict):
     data = json.dumps(state, separators=(",", ":")).encode("utf-8")
     blob.upload_blob(data, overwrite=True)
 
+TRADES_HEADER = ("time_utc,model,pair,side,qty,avg_price,quote_usdt,fee,fee_asset,"
+                 "order_id,b_level,s_level,pnl_pct_since_open")
+
 def ensure_trades_csv(ctx: Ctx, pair: str):
     name = f"{pair}_trades.csv"
-    append_client = _get_append_client(ctx.trades_cc.container_name, name)
-    header = ("time_utc,model,pair,side,qty,avg_price,quote_usdt,fee,fee_asset,"
-              "order_id,b_level,s_level,pnl_pct_since_open\n")
-    try:
-        append_client.create_append_blob()
-        append_client.append_block(header.encode("utf-8"))
-        return
-    except ResourceExistsError:
-        pass
-
-    # ověř hlavičku
     blob = ctx.trades_cc.get_blob_client(name)
-    try:
-        head = blob.download_blob(offset=0, length=256).readall().decode("utf-8", "ignore")
-    except ResourceNotFoundError:
-        # závodní podmínka – založ znovu a přidej hlavičku
-        append_client.create_append_blob()
-        append_client.append_block(header.encode("utf-8"))
-        return
-
-    if not head.startswith(header):
-        append_client.append_block(header.encode("utf-8"))
+    _ensure_blob_with_header(blob, TRADES_HEADER)
 
 def append_trade(ctx: Ctx, pair: str, row: Dict):
     ensure_trades_csv(ctx, pair)
-    name = f"{pair}_trades.csv"
-    append_client = _get_append_client(ctx.trades_cc.container_name, name)
+    blob = ctx.trades_cc.get_blob_client(f"{pair}_trades.csv")
     line = ",".join([
         row.get("time_utc",""),
         row.get("model",""),
@@ -348,7 +335,7 @@ def append_trade(ctx: Ctx, pair: str, row: Dict):
         "{0:.8f}".format(row.get("s_level",0.0)),
         "{0:.6f}".format(row.get("pnl_pct_since_open",0.0))
     ]) + "\n"
-    append_client.append_block(line.encode("utf-8"))
+    _append_lines_block_blob(blob, line)
 
 # ------------------ SIGNALS ------------------
 
@@ -416,9 +403,9 @@ def trade_tick(ctx: Ctx, pair: str, model: str):
     st["session_tag"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     save_state(ctx, pair, model, st)
 
-    info = get_exchange_info(pair)
+    info = get_exchange_info(pair, ctx.trades_cc)
     filt = symbol_filters(info)
-    price = get_price(pair)
+    price = get_price(pair, ctx.trades_cc)
 
     if st["position"] == "flat":
         if price <= B:
@@ -428,7 +415,7 @@ def trade_tick(ctx: Ctx, pair: str, model: str):
                 "type": "MARKET",
                 "quoteOrderQty": "{0:.2f}".format(TRADE_USDT_PER_ORDER)
             }
-            resp = binance_post("/api/v3/order", params)
+            resp = binance_post("/api/v3/order", params, trades_cc=ctx.trades_cc)
             fills = resp.get("fills", [])
             if fills:
                 total_quote = sum(float(f["price"]) * float(f["qty"]) for f in fills)
@@ -478,7 +465,7 @@ def trade_tick(ctx: Ctx, pair: str, model: str):
                 "type": "MARKET",
                 "quantity": "{0:.8f}".format(qty_to_sell)
             }
-            resp = binance_post("/api/v3/order", params)
+            resp = binance_post("/api/v3/order", params, trades_cc=ctx.trades_cc)
             fills = resp.get("fills", [])
             if fills:
                 total_quote = sum(float(f["price"]) * float(f["qty"]) for f in fills)
@@ -543,12 +530,9 @@ def main(mytimer: func.TimerRequest) -> None:
             except ResourceExistsError:
                 pass
 
-        # Inicializuj API log cache (aby měl kontejnery)
+        # API log cache (pro předání trades_cc do REST helperů)
         _API_LOG_CACHE["svc"] = blob_service
         _API_LOG_CACHE["cc"]  = trades_cc
-        _API_LOG_CACHE["append_client"] = None
-        _API_LOG_CACHE["blob_name"] = None
-        _API_LOG_CACHE["header_written"] = False
 
         ctx = Ctx(blob_service, signals_cc, trades_cc, state_cc)
 
@@ -561,7 +545,6 @@ def main(mytimer: func.TimerRequest) -> None:
                 trade_tick(ctx, pair, model)
             except Exception:
                 logger.exception("[%s] tick error", pair)
-
             if time.time() - start > TIMEOUT_SEC_PER_TICK:
                 break
 
