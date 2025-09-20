@@ -3,7 +3,6 @@ import hmac
 import json
 import time
 import math
-import base64
 import hashlib
 import logging
 import urllib.parse
@@ -12,9 +11,8 @@ from datetime import datetime, timezone
 import azure.functions as func
 import pandas as pd
 import requests
-from azure.storage.blob import BlobServiceClient, ContainerClient, BlobClient, AppendBlobClient
+from azure.storage.blob import BlobServiceClient, ContainerClient
 from azure.core.exceptions import ResourceNotFoundError, ResourceExistsError
-
 
 # ------------------ ENV & CONFIG ------------------
 
@@ -43,7 +41,8 @@ def _parse_pairs_models(val: str) -> list[tuple[str, str]]:
     if not val: return res
     parts = [p.strip() for p in val.split(",") if p.strip()]
     for p in parts:
-        if ":" not in p: continue
+        if ":" not in p: 
+            continue
         pair, model = p.split(":", 1)
         res.append((pair.strip().upper(), model.strip()))
     return res
@@ -56,7 +55,8 @@ def _parse_overrides(env_val: str) -> dict[str, float]:
     if not env_val: return out
     for piece in env_val.split(","):
         piece = piece.strip()
-        if not piece or ":" not in piece: continue
+        if not piece or ":" not in piece: 
+            continue
         k, v = piece.split(":", 1)
         k = k.strip().upper()
         try:
@@ -72,15 +72,15 @@ OVR_CYCLES = _parse_overrides(os.getenv("MIN_CYCLES_PER_DAY_OVERRIDES", ""))
 OVR_SCORE  = _parse_overrides(os.getenv("MIN_SCORE_OVERRIDES", ""))
 
 # Storage (one account, multiple containers)
-WEBJOBS_CONN     = _get_env("AzureWebJobsStorage", required=True)
-SIGNALS_CONTAINER= _get_env("SIGNALS_CONTAINER", "market-signals")
-MASTER_CSV_NAME  = _get_env("MASTER_CSV_NAME", "bs_levels_master.csv")
-TRADES_CONTAINER = _get_env("TRADES_CONTAINER", "trade-logs")
-STATE_CONTAINER  = _get_env("STATE_CONTAINER", "bot-state")
+WEBJOBS_CONN      = _get_env("AzureWebJobsStorage", required=True)
+SIGNALS_CONTAINER = _get_env("SIGNALS_CONTAINER", "market-signals")
+MASTER_CSV_NAME   = _get_env("MASTER_CSV_NAME", "bs_levels_master.csv")
+TRADES_CONTAINER  = _get_env("TRADES_CONTAINER", "trade-logs")
+STATE_CONTAINER   = _get_env("STATE_CONTAINER", "bot-state")
 
 # Binance
-BINANCE_BASE_URL = _get_env("BINANCE_BASE_URL", "https://testnet.binance.vision")
-BINANCE_API_KEY  = _get_env("BINANCE_API_KEY", required=True)
+BINANCE_BASE_URL   = _get_env("BINANCE_BASE_URL", "https://testnet.binance.vision")
+BINANCE_API_KEY    = _get_env("BINANCE_API_KEY", required=True)
 BINANCE_API_SECRET = _get_env("BINANCE_API_SECRET", required=True)
 
 QUOTE_ASSET = _get_env("QUOTE_ASSET", "USDT").upper()
@@ -135,14 +135,20 @@ def save_state(pair: str, model: str, state: dict):
 
 def ensure_trades_csv(pair: str):
     blob = trades_cc.get_blob_client(f"{pair}_trades.csv")
-    if not blob.exists():
-        hdr = "time_utc,model,pair,side,qty,avg_price,quote_usdt,fee,fee_asset,order_id,b_level,s_level,pnl_pct_since_open\n"
-        AppendBlobClient.from_blob_url(blob.url, credential=blob_service.credential).create_blob()
-        AppendBlobClient.from_blob_url(blob.url, credential=blob_service.credential).append_block(hdr.encode("utf-8"))
+    append_client = blob.as_append_blob_client()
+    try:
+        append_client.create_blob()
+        hdr = ("time_utc,model,pair,side,qty,avg_price,quote_usdt,fee,fee_asset,"
+               "order_id,b_level,s_level,pnl_pct_since_open\n")
+        append_client.append_block(hdr.encode("utf-8"))
+    except ResourceExistsError:
+        # už existuje
+        pass
 
 def append_trade(pair: str, row: dict):
     ensure_trades_csv(pair)
     blob = trades_cc.get_blob_client(f"{pair}_trades.csv")
+    append_client = blob.as_append_blob_client()
     line = ",".join([
         row.get("time_utc",""),
         row.get("model",""),
@@ -158,7 +164,7 @@ def append_trade(pair: str, row: dict):
         f"{row.get('s_level',0):.8f}",
         f"{row.get('pnl_pct_since_open',0):.6f}"
     ]) + "\n"
-    AppendBlobClient.from_blob_url(blob.url, credential=blob_service.credential).append_block(line.encode("utf-8"))
+    append_client.append_block(line.encode("utf-8"))
 
 # ------------------ SIGNALS (B/S) ------------------
 
@@ -251,7 +257,8 @@ def get_exchange_info(pair: str) -> dict:
     return data
 
 def round_step(value: float, step: float) -> float:
-    if step <= 0: return value
+    if step <= 0: 
+        return value
     return math.floor(value / step) * step
 
 def symbol_filters(info: dict) -> dict:
@@ -294,7 +301,7 @@ def trade_tick(pair: str, model: str):
     if st["position"] == "flat":
         # long-only open rule
         if price <= B:
-            # market BUY using quoteOrderQty in USDT
+            # Market BUY using quoteOrderQty in USDT
             params = {
                 "symbol": pair,
                 "side": "BUY",
@@ -303,17 +310,17 @@ def trade_tick(pair: str, model: str):
             }
             resp = binance_post("/api/v3/order", params)
             qty = sum(float(f["qty"]) for f in resp.get("fills", [])) or float(resp.get("executedQty", 0))
-            csum = sum(float(f.get("commission", 0)) for f in resp.get("fills", []))
-            casset = resp.get("fills", [{}])[0].get("commissionAsset", QUOTE_ASSET) if resp.get("fills") else QUOTE_ASSET
-            # Average fill price
+            # average fill price
             fills = resp.get("fills", [])
             if fills:
                 total_quote = sum(float(f["price"]) * float(f["qty"]) for f in fills)
                 total_qty = sum(float(f["qty"]) for f in fills) or 1e-12
                 avg_price = total_quote / total_qty
+                fee = sum(float(f.get("commission", 0)) for f in fills)
+                fee_asset = fills[0].get("commissionAsset", QUOTE_ASSET)
             else:
-                # fallback
                 avg_price = float(resp.get("cummulativeQuoteQty", 0)) / max(float(resp.get("executedQty", 0)) or 1e-12, 1e-12)
+                fee = 0.0; fee_asset = QUOTE_ASSET
 
             st["position"] = "long"
             st["qty"] = qty
@@ -330,8 +337,8 @@ def trade_tick(pair: str, model: str):
                 "qty": qty,
                 "avg_price": avg_price,
                 "quote_usdt": TRADE_USDT_PER_ORDER,
-                "fee": csum,
-                "fee_asset": casset,
+                "fee": fee,
+                "fee_asset": fee_asset,
                 "order_id": resp.get("orderId"),
                 "b_level": B,
                 "s_level": S,
@@ -341,7 +348,7 @@ def trade_tick(pair: str, model: str):
 
     elif st["position"] == "long":
         if price >= S:
-            # market SELL full position
+            # Market SELL full position
             qty_to_sell = round_step(float(st.get("qty", 0.0)), filt["stepSize"])
             if qty_to_sell <= 0:
                 logger.warning(f"[{pair}] qty_to_sell <= 0, resetting to flat.")
@@ -401,20 +408,23 @@ def trade_tick(pair: str, model: str):
 # ------------------ ENTRYPOINT ------------------
 
 def main(mytimer: func.TimerRequest) -> None:
-    start = time.time()
-    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    logger.info(f"[BinanceTradeBot] Tick {now_utc} — pairs={len(PAIRS_MODELS)}")
+    try:
+        start = time.time()
+        now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        logger.info(f"[BinanceTradeBot] Tick {now_utc} — pairs={len(PAIRS_MODELS)}")
 
-    if not PAIRS_MODELS:
-        logger.error("PAIRS_MODELS is empty. Set e.g. 'XRPUSDT:BS_MedianScore,BTCUSDT:BS_MedianScore'.")
-        return
+        if not PAIRS_MODELS:
+            logger.error("PAIRS_MODELS is empty. Set e.g. 'XRPUSDT:BS_MedianScore,BTCUSDT:BS_MedianScore'.")
+            return
 
-    for (pair, model) in PAIRS_MODELS:
-        try:
-            trade_tick(pair, model)
-        except Exception as e:
-            logger.exception(f"[{pair}] tick error: {e}")
-
-        if time.time() - start > TIMEOUT_SEC_PER_TICK:
-            logger.warning("TIMEOUT_SEC_PER_TICK reached; stopping this tick early.")
-            break
+        for (pair, model) in PAIRS_MODELS:
+            try:
+                trade_tick(pair, model)
+            except Exception:
+                logger.exception(f"[{pair}] tick error")
+            if time.time() - start > TIMEOUT_SEC_PER_TICK:
+                logger.warning("TIMEOUT_SEC_PER_TICK reached; stopping this tick early.")
+                break
+    except Exception:
+        logger.exception("[BinanceTradeBot] Unhandled exception in main()")
+        raise
