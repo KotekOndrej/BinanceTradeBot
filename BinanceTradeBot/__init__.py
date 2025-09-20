@@ -11,6 +11,10 @@ from typing import Optional, List, Tuple, Dict
 
 import azure.functions as func  # lehký import
 
+# ---- Azure Blob SDK (konzistentní se staršími verzemi) ----
+from azure.storage.blob import BlobServiceClient, ContainerClient, BlobClient, AppendBlobClient
+from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
+
 # ------------------ ENV & CONFIG ------------------
 
 def _get_env(name: str, default: Optional[str] = None, required: bool = False) -> Optional[str]:
@@ -110,69 +114,71 @@ def _sign(params: Dict, secret: str) -> str:
 def _headers() -> Dict[str, str]:
     return {"X-MBX-APIKEY": BINANCE_API_KEY or "", "Content-Type": "application/x-www-form-urlencoded"}
 
-# ---------- API CALL FILE LOGGING (to trade-logs) ----------
+# ---------- API CALL FILE LOGGING (to trade-logs, AppendBlobClient) ----------
 
-# Lazy-inicializované singletony pro zápis logů do AppendBlob
 _API_LOG_CACHE = {
-    "svc": None,
-    "cc": None,
-    "blob_name": None,
-    "append_client": None,
+    "svc": None,            # BlobServiceClient
+    "cc": None,             # ContainerClient (trade-logs)
+    "blob_name": None,      # current api_calls_YYYY-MM-DD.csv
+    "append_client": None,  # AppendBlobClient
     "header_written": False,
 }
 
 def _api_log_blob_name() -> str:
-    # Denní rotace souboru
     d = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     return f"api_calls_{d}.csv"
 
-def _get_api_log_append_client():
-    from azure.storage.blob import BlobServiceClient
-    from azure.core.exceptions import ResourceExistsError
+def _get_append_client(container_name: str, blob_name: str) -> AppendBlobClient:
+    return AppendBlobClient.from_connection_string(
+        conn_str=WEBJOBS_CONN,
+        container_name=container_name,
+        blob_name=blob_name,
+    )
 
-    # Pokud se změnil den, přepneme soubor
+def _get_api_log_append_client():
+    # Denní rotace souboru
     current_name = _api_log_blob_name()
+
+    # Pokud máme klienta pro dnešek, vrať ho
     if _API_LOG_CACHE["append_client"] is not None and _API_LOG_CACHE["blob_name"] == current_name:
         return _API_LOG_CACHE["append_client"]
 
     if not WEBJOBS_CONN:
-        # Bez připojení k úložišti log do souboru nejde – vrátíme None
-        return None
+        return None  # bez storage nelze logovat do souboru
 
+    # Init service/container
     if _API_LOG_CACHE["svc"] is None:
         _API_LOG_CACHE["svc"] = BlobServiceClient.from_connection_string(WEBJOBS_CONN)
-
     if _API_LOG_CACHE["cc"] is None:
-        _API_LOG_CACHE["cc"] = _API_LOG_CACHE["svc"].get_container_client(TRADES_CONTAINER)
+        cc = _API_LOG_CACHE["svc"].get_container_client(TRADES_CONTAINER)
         try:
-            _API_LOG_CACHE["cc"].create_container()
+            cc.create_container()
         except ResourceExistsError:
             pass
+        _API_LOG_CACHE["cc"] = cc
 
-    blob = _API_LOG_CACHE["cc"].get_blob_client(current_name)
-    append_client = blob.as_append_blob_client()
+    trades_cc: ContainerClient = _API_LOG_CACHE["cc"]
+    append_client = _get_append_client(trades_cc.container_name, current_name)
+
     try:
-        append_client.create_blob()
-        # zapiš header
+        append_client.create_append_blob()
         header = "time_utc,method,path,params_json,status,duration_ms,error\n"
         append_client.append_block(header.encode("utf-8"))
-        _API_LOG_CACHE["header_written"] = True
     except ResourceExistsError:
-        if not _API_LOG_CACHE["header_written"]:
-            # Zkus načíst prvních pár byte a ověřit hlavičku
-            try:
-                chunk = blob.download_blob(offset=0, length=64).readall().decode("utf-8", "ignore")
-                if not chunk.startswith("time_utc,method,path,params_json,status,duration_ms,error"):
-                    header = "time_utc,method,path,params_json,status,duration_ms,error\n"
-                    append_client.append_block(header.encode("utf-8"))
-            except Exception:
-                # když se nepovede čtení, pokusíme se header dopsat
+        # ověř hlavičku
+        blob = trades_cc.get_blob_client(current_name)
+        try:
+            chunk = blob.download_blob(offset=0, length=64).readall().decode("utf-8", "ignore")
+            if not chunk.startswith("time_utc,method,path,params_json,status,duration_ms,error"):
                 header = "time_utc,method,path,params_json,status,duration_ms,error\n"
                 append_client.append_block(header.encode("utf-8"))
-        _API_LOG_CACHE["header_written"] = True
+        except Exception:
+            header = "time_utc,method,path,params_json,status,duration_ms,error\n"
+            append_client.append_block(header.encode("utf-8"))
 
     _API_LOG_CACHE["append_client"] = append_client
     _API_LOG_CACHE["blob_name"] = current_name
+    _API_LOG_CACHE["header_written"] = True
     return append_client
 
 def _redact_params(p: Dict) -> Dict:
@@ -187,17 +193,16 @@ def _append_api_call(method: str, path: str, params: Dict, status: int, duration
     try:
         ac = _get_api_log_append_client()
         if ac is None:
-            return  # bez storage to prostě neuložíme
+            return
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         params_json = json.dumps(_redact_params(params or {}), separators=(",", ":"), ensure_ascii=False)
-        # unikáme čárky jen v JSON (CSV sloupec je JSON string – ok)
         line = f"{now},{method},{path},{params_json},{status},{duration_ms},{'' if not error else error.replace(',', ';')}\n"
         ac.append_block(line.encode("utf-8"))
     except Exception:
-        # Neselhej kvůli logu; případ logu neblokuje trading
+        # Log nesmí blokovat obchodování
         logger.error("[api-log] failed to append api call", exc_info=True)
 
-# ---------- Reálné REST volání s file-loggingem ----------
+# ---------- REST GET/POST s file-loggingem ----------
 
 def binance_get(path: str, params: Optional[Dict] = None, signed: bool = False):
     import requests
@@ -214,7 +219,7 @@ def binance_get(path: str, params: Optional[Dict] = None, signed: bool = False):
     try:
         r = requests.get(url, params=params, headers=_headers(), timeout=20)
         dur = int((time.time() - t0) * 1000)
-        _append_api_call("GET", path, params, r.status_code, dur, None if r.status_code in (200,) else r.text[:120])
+        _append_api_call("GET", path, params, r.status_code, dur, None if r.status_code == 200 else r.text[:120])
         if r.status_code == 200:
             return r.json()
         raise RuntimeError("GET {0} {1}: {2}".format(path, r.status_code, r.text[:200]))
@@ -238,7 +243,7 @@ def binance_post(path: str, params: Dict, signed: bool = True):
     try:
         r = requests.post(url, data=params, headers=_headers(), timeout=20)
         dur = int((time.time() - t0) * 1000)
-        _append_api_call("POST", path, params, r.status_code, dur, None if r.status_code in (200,201) else r.text[:120])
+        _append_api_call("POST", path, params, r.status_code, dur, None if r.status_code in (200, 201) else r.text[:120])
         if r.status_code in (200, 201):
             return r.json()
         raise RuntimeError("POST {0} {1}: {2}".format(path, r.status_code, r.text[:200]))
@@ -286,7 +291,6 @@ def _state_blob_name(pair: str, model: str) -> str:
     return f"{pair}_{model}.json"
 
 def load_state(ctx: Ctx, pair: str, model: str) -> Dict:
-    from azure.core.exceptions import ResourceNotFoundError
     blob = ctx.state_cc.get_blob_client(_state_blob_name(pair, model))
     try:
         data = blob.download_blob().readall()
@@ -308,21 +312,38 @@ def save_state(ctx: Ctx, pair: str, model: str, state: Dict):
     blob.upload_blob(data, overwrite=True)
 
 def ensure_trades_csv(ctx: Ctx, pair: str):
-    from azure.core.exceptions import ResourceExistsError
-    blob = ctx.trades_cc.get_blob_client(f"{pair}_trades.csv")
-    append_client = blob.as_append_blob_client()
+    name = f"{pair}_trades.csv"
+    append_client = _get_append_client(ctx.trades_cc.container_name, name)
     try:
-        append_client.create_blob()
+        append_client.create_append_blob()
         hdr = ("time_utc,model,pair,side,qty,avg_price,quote_usdt,fee,fee_asset,"
                "order_id,b_level,s_level,pnl_pct_since_open\n")
         append_client.append_block(hdr.encode("utf-8"))
+        return
     except ResourceExistsError:
         pass
 
+    # ověř hlavičku
+    blob = ctx.trades_cc.get_blob_client(name)
+    try:
+        head = blob.download_blob(offset=0, length=256).readall().decode("utf-8", "ignore")
+    except ResourceNotFoundError:
+        # závodní podmínka – založ znovu
+        append_client.create_append_blob()
+        hdr = ("time_utc,model,pair,side,qty,avg_price,quote_usdt,fee,fee_asset,"
+               "order_id,b_level,s_level,pnl_pct_since_open\n")
+        append_client.append_block(hdr.encode("utf-8"))
+        return
+
+    hdr = ("time_utc,model,pair,side,qty,avg_price,quote_usdt,fee,fee_asset,"
+           "order_id,b_level,s_level,pnl_pct_since_open\n")
+    if not head.startswith(hdr):
+        append_client.append_block(hdr.encode("utf-8"))
+
 def append_trade(ctx: Ctx, pair: str, row: Dict):
     ensure_trades_csv(ctx, pair)
-    blob = ctx.trades_cc.get_blob_client(f"{pair}_trades.csv")
-    append_client = blob.as_append_blob_client()
+    name = f"{pair}_trades.csv"
+    append_client = _get_append_client(ctx.trades_cc.container_name, name)
     line = ",".join([
         row.get("time_utc",""),
         row.get("model",""),
@@ -355,7 +376,6 @@ def load_active_signal(ctx: Ctx, pair: str, model: str) -> Optional[Dict]:
         logger.error("[signals] pandas import failed: %s", ie)
         return None
 
-    from azure.core.exceptions import ResourceNotFoundError
     blob = ctx.signals_cc.get_blob_client(MASTER_CSV_NAME)
     try:
         data = blob.download_blob().readall()
@@ -397,7 +417,6 @@ def load_active_signal(ctx: Ctx, pair: str, model: str) -> Optional[Dict]:
 # ------------------ TRADING LOGIC ------------------
 
 def trade_tick(ctx: Ctx, pair: str, model: str):
-    start = time.time()
     sig = load_active_signal(ctx, pair, model)
     if not sig:
         return
@@ -515,15 +534,10 @@ def trade_tick(ctx: Ctx, pair: str, model: str):
 def main(mytimer: func.TimerRequest) -> None:
     try:
         start = time.time()
-        now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
         if not PAIRS_MODELS:
             logger.error("PAIRS_MODELS is empty. Set e.g. 'XRPUSDT:BS_MedianScore,BTCUSDT:BS_MedianScore'.")
             return
-
-        # Lazy init storage až teď
-        from azure.storage.blob import BlobServiceClient
-        from azure.core.exceptions import ResourceExistsError
 
         if not WEBJOBS_CONN:
             logger.error("AzureWebJobsStorage is not set.")
@@ -540,7 +554,7 @@ def main(mytimer: func.TimerRequest) -> None:
             except ResourceExistsError:
                 pass
 
-        # Inicializuj cache pro API log (aby měl k dispozici kontejnery)
+        # Inicializuj API log cache (aby měl kontejnery)
         _API_LOG_CACHE["svc"] = blob_service
         _API_LOG_CACHE["cc"]  = trades_cc
         _API_LOG_CACHE["append_client"] = None
@@ -549,7 +563,7 @@ def main(mytimer: func.TimerRequest) -> None:
 
         ctx = Ctx(blob_service, signals_cc, trades_cc, state_cc)
 
-        # OPTIONAL: vytvoř CSV pro trade logy, i když nebude obchod
+        # Volitelně založ trade CSV i bez obchodů
         for (pair, model) in PAIRS_MODELS:
             ensure_trades_csv(ctx, pair)
 
@@ -560,7 +574,6 @@ def main(mytimer: func.TimerRequest) -> None:
                 logger.exception("[%s] tick error", pair)
 
             if time.time() - start > TIMEOUT_SEC_PER_TICK:
-                # Pokud chceš, můžeš přelogovat, ale nechávám minimalisticky
                 break
 
     except Exception:
