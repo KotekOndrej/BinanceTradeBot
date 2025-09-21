@@ -9,11 +9,12 @@ import logging
 import urllib.parse
 from datetime import datetime, timezone
 from typing import Dict, Any, Tuple, Optional, List
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import azure.functions as func
 import requests
 
-# ---------------------- ENV ----------------------
+# ====================== ENV ======================
 
 def _get_env(name: str, default: Optional[str] = None, required: bool = False) -> str:
     v = os.getenv(name, default)
@@ -29,6 +30,11 @@ def _get_int(name: str, default: int) -> int:
     try: return int(os.getenv(name, str(default)))
     except: return default
 
+def _get_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "")
+    if raw == "": return default
+    return str(raw).lower() in ("1","true","yes","y","on")
+
 # Azure Storage
 WEBJOBS_CONN           = _get_env("AzureWebJobsStorage", required=True)
 MODELS_CONTAINER       = _get_env("MODELS_CONTAINER", "models-recalc")
@@ -43,7 +49,6 @@ MIN_SCORE              = _get_float("MIN_SCORE", 0.0)
 
 # Objednávky
 ORDER_USDT             = _get_float("ORDER_USDT", 10.0)   # Market BUY utratí přesně tuto částku (quoteOrderQty)
-TAKER_FEE_PCT          = _get_float("COSTS_PCT", 0.001)   # pouze informativně do logu
 
 # Binance API
 BINANCE_API_KEY        = _get_env("BINANCE_API_KEY", required=True)
@@ -52,13 +57,17 @@ USE_TESTNET            = (_get_env("BINANCE_TESTNET", "true").lower() in ("1","t
 RECV_WINDOW            = _get_int("BINANCE_RECV_WINDOW", 5000)
 TIMEOUT_S              = _get_int("BINANCE_HTTP_TIMEOUT", 15)
 
+# výkon
+PRICE_FETCH_WORKERS    = _get_int("PRICE_FETCH_WORKERS", 10)  # paralelní vlákna pro ticker/price
+API_CSV_LOGGING        = _get_bool("API_CSV_LOGGING", True)   # vypnout na produkci lze nastavením 0/false
+
 BASE_URL = "https://testnet.binance.vision" if USE_TESTNET else "https://api.binance.com"
 
 logger = logging.getLogger("BinanceTradeBot")
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
 
-# ---------------------- Azure Blob helpers ----------------------
+# ====================== Azure Blob helpers ======================
 
 def _make_blob_clients():
     from azure.storage.blob import BlobServiceClient
@@ -89,81 +98,108 @@ def _write_blob_json(cc, name: str, obj: Dict[str, Any]) -> None:
         overwrite=True
     )
 
+# --- Append řádek do textového blobu přes block list (bez download) ---
+def _append_text_blob_blocklist(container_client, blob_name: str, text_to_append: str):
+    """
+    Bezpečný append pro text: stáhne jen seznam commited block IDs, přidá nový block a commitne.
+    Funguje na BlockBlob (nenutí AppendBlob).
+    """
+    from azure.storage.blob import BlobBlock
+    from azure.core.exceptions import ResourceNotFoundError
+    import base64, secrets
+
+    bc = container_client.get_blob_client(blob_name)
+
+    # pokud blob neexistuje, vytvoř prázdný
+    try:
+        bc.get_blob_properties()
+    except ResourceNotFoundError:
+        bc.upload_blob(b"", overwrite=True)
+
+    # získej existující block list
+    bl = bc.get_block_list(block_list_type="committed")
+    committed = []
+    if hasattr(bl, "committed_blocks") and bl.committed_blocks:
+        committed = [b.id for b in bl.committed_blocks if getattr(b, "id", None)]
+    elif isinstance(bl, list):
+        committed = [getattr(b, "id", None) for b in bl if getattr(b, "id", None)]
+
+    # nový block
+    block_id = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
+    bc.stage_block(block_id=block_id, data=text_to_append.encode("utf-8"))
+
+    # commit combined
+    new_list = [BlobBlock(bid) for bid in committed] + [BlobBlock(block_id)]
+    bc.commit_block_list(new_list)
+
 def _append_trade_line(logs_cc, blob_name: str, line: str):
+    # pokud blob neexistuje, připrav hlavičku
     from azure.core.exceptions import ResourceNotFoundError
     bc = logs_cc.get_blob_client(blob_name)
+    header = "time_utc,pair,model,side,executedQty,avgFillPrice,cummulativeQuoteQty,fee_total,fee_asset,orderId,b_level,s_level,b_signal_date\n"
     try:
-        old = bc.download_blob().readall().decode("utf-8")
+        bc.get_blob_properties()
     except ResourceNotFoundError:
-        old = "time_utc,pair,model,side,executedQty,avgFillPrice,cummulativeQuoteQty,fee_total,fee_asset,orderId,b_level,s_level,b_signal_date\n"
-    bc.upload_blob((old + line), overwrite=True)
+        bc.upload_blob(header.encode("utf-8"), overwrite=True)
+    _append_text_blob_blocklist(logs_cc, blob_name, line)
 
-# ---------------------- API call CSV logging ----------------------
+# ====================== API call CSV logging ======================
 
 def _api_csv_blob_name() -> str:
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     return f"api_calls_{today}.csv"
 
-def _append_api_csv(logs_cc, row: Dict[str, Any]):
-    """
-    Zapíše jeden řádek do denního CSV s API voláními.
-    Sloupce: ts,method,path,params,status,error,resp_sample
-    """
+def _ensure_api_csv_header(logs_cc):
     from azure.core.exceptions import ResourceNotFoundError
     bc = logs_cc.get_blob_client(_api_csv_blob_name())
-    header = "ts,method,path,params,status,error,resp_sample\n"
     try:
-        old = bc.download_blob().readall().decode("utf-8")
-        if not old.startswith("ts,"):
-            old = header
+        bc.get_blob_properties()
     except ResourceNotFoundError:
-        old = header
-    # serializace hodnot (params jako JSON bez citlivých klíčů)
-    params_ser = json.dumps(row.get("params", {}), ensure_ascii=False, separators=(",", ":"))
-    resp_sample = row.get("resp_sample", "")
-    # omez výstup
-    if isinstance(resp_sample, str) and len(resp_sample) > 1000:
-        resp_sample = resp_sample[:1000] + "..."
-    line = ",".join([
-        row.get("ts",""),
-        row.get("method",""),
-        row.get("path",""),
-        params_ser.replace("\n"," ").replace("\r"," "),
-        str(row.get("status","")),
-        (row.get("error","") or "").replace("\n"," ").replace("\r"," "),
-        (resp_sample or "").replace("\n"," ").replace("\r"," ")
-    ]) + "\n"
-    bc.upload_blob(old + line, overwrite=True)
+        header = "ts,method,path,params,status,error,resp_sample\n"
+        bc.upload_blob(header.encode("utf-8"), overwrite=True)
 
 def _sanitize_params(p: Dict[str, Any]) -> Dict[str, Any]:
-    # odstraň citlivé/směšně dlouhé věci
     if not isinstance(p, dict):
         return {}
     cleaned = dict(p)
     cleaned.pop("signature", None)
     return cleaned
 
-def _log_api_call_csv(logs_cc, *, method: str, path: str, params: Dict[str, Any], status: int, error: Optional[str], resp_text: Optional[str]):
-    try:
-        _append_api_csv(logs_cc, {
-            "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "method": method,
-            "path": path,
-            "params": _sanitize_params(params or {}),
-            "status": status,
-            "error": error or "",
-            "resp_sample": resp_text or ""
-        })
-    except Exception:
-        # Logging CSV selhat nesmí zlomit trading
-        logger.warning("[api-csv] failed to append log", exc_info=True)
+def _append_api_csv(logs_cc, *, method: str, path: str, params: Dict[str, Any], status: Any, error: Optional[str], resp_text: Optional[str]):
+    if not API_CSV_LOGGING:
+        return
+    _ensure_api_csv_header(logs_cc)
+    # omez výstup
+    params_ser = json.dumps(_sanitize_params(params or {}), ensure_ascii=False, separators=(",", ":"))
+    resp_sample = (resp_text or "")
+    if isinstance(resp_sample, str) and len(resp_sample) > 1000:
+        resp_sample = resp_sample[:1000] + "..."
+    line = ",".join([
+        datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        method,
+        path,
+        params_ser.replace("\n"," ").replace("\r"," "),
+        str(status or ""),
+        (error or "").replace("\n"," ").replace("\r"," "),
+        resp_sample.replace("\n"," ").replace("\r"," ")
+    ]) + "\n"
+    _append_text_blob_blocklist(logs_cc, _api_csv_blob_name(), line)
 
-# ---------------------- Master CSV loader ----------------------
+# ====================== Master CSV loader (1× za tik) ======================
 
-def _load_active_signal_for(models_cc, pair: str, model: str) -> Optional[Dict[str, Any]]:
+def _parse_pairs_models(val: str) -> List[Tuple[str,str]]:
+    out = []
+    for piece in val.split(","):
+        piece = piece.strip()
+        if not piece or ":" not in piece: continue
+        pair, model = piece.split(":",1)
+        out.append((pair.strip().upper(), model.strip()))
+    return out
+
+def _load_master_signals_map(models_cc) -> Dict[Tuple[str,str], Dict[str,Any]]:
     """
-    Z master CSV vybere poslední řádek pro pair+model s is_active=True
-    a prahy (min cycles/score). Akceptuje jak 'cycles', tak 'total_cycles'.
+    Načte master CSV 1×, vyfiltruje is_active a prahy (MIN_CYCLES_PER_DAY, MIN_SCORE),
+    a pro každé (pair, model) vrátí poslední (podle date, load_time_utc) řádek s B/S.
     """
     import pandas as pd
     from azure.core.exceptions import ResourceNotFoundError
@@ -173,39 +209,44 @@ def _load_active_signal_for(models_cc, pair: str, model: str) -> Optional[Dict[s
         raw = blob.download_blob().readall()
     except ResourceNotFoundError:
         logger.error("Master CSV not found.")
-        return None
+        return {}
 
     df = pd.read_csv(io.BytesIO(raw))
     required = {"pair","model","B","S","date","load_time_utc","is_active","score"}
     if not required.issubset(df.columns):
-        logger.error("Master CSV missing columns, have: %s", df.columns.tolist())
-        return None
+        logger.error("Master CSV missing columns, have: %s", df.columns.tolist()); return {}
 
+    # alias pro počet cyklů
     cycles_col = "cycles" if "cycles" in df.columns else ("total_cycles" if "total_cycles" in df.columns else None)
     if cycles_col is None:
-        logger.error("Master CSV must contain 'cycles' or 'total_cycles'. Columns: %s", df.columns.tolist())
-        return None
+        logger.error("Master CSV musí obsahovat 'cycles' nebo 'total_cycles'."); return {}
 
+    # normalizace
     df["pair"] = df["pair"].astype(str).str.upper()
     df["model"] = df["model"].astype(str)
-    df = df[(df["pair"]==pair.upper()) & (df["model"]==model)]
-    if df.empty:
-        return None
 
+    # filtry
     df = df[(df["is_active"]==True) &
             (df[cycles_col] >= MIN_CYCLES_PER_DAY) &
             (df["score"]  >= MIN_SCORE)].copy()
     if df.empty:
-        return None
+        return {}
 
+    # parse čas
+    import pandas as pd
     df["load_time_utc"] = pd.to_datetime(df["load_time_utc"], errors="coerce", utc=True)
-    df = df.sort_values(["date","load_time_utc"])
-    r = df.iloc[-1]
 
-    try:
-        return {
-            "pair": pair.upper(),
-            "model": model,
+    # vezmi poslední per (pair, model)
+    df = df.sort_values(["pair","model","date","load_time_utc"])
+    latest = df.groupby(["pair","model"], as_index=False).tail(1)
+
+    # výstupní mapa
+    out: Dict[Tuple[str,str], Dict[str,Any]] = {}
+    for _, r in latest.iterrows():
+        key = (str(r["pair"]).upper(), str(r["model"]))
+        out[key] = {
+            "pair": key[0],
+            "model": key[1],
             "B": float(r["B"]),
             "S": float(r["S"]),
             "date": str(r["date"]),
@@ -213,11 +254,9 @@ def _load_active_signal_for(models_cc, pair: str, model: str) -> Optional[Dict[s
             "cycles": float(r[cycles_col]),
             "score": float(r["score"])
         }
-    except Exception:
-        logger.exception("Failed to parse master row for %s/%s", pair, model)
-        return None
+    return out
 
-# ---------------------- Binance REST helpers (s CSV logging) ----------------------
+# ====================== Binance REST helpers (Session + CSV log) ======================
 
 def _sign(query: str) -> str:
     return hmac.new(BINANCE_API_SECRET.encode("utf-8"), query.encode("utf-8"), hashlib.sha256).hexdigest()
@@ -228,29 +267,27 @@ def _ts() -> int:
 def _headers() -> Dict[str,str]:
     return {"X-MBX-APIKEY": BINANCE_API_KEY}
 
-def api_get(path: str, params: Dict[str, Any], *, logs_cc=None) -> Any:
+def api_get(session: requests.Session, path: str, params: Dict[str, Any], *, logs_cc=None) -> Any:
     url = f"{BASE_URL}{path}"
     try:
-        r = requests.get(url, params=params, headers=_headers(), timeout=TIMEOUT_S)
+        r = session.get(url, params=params, headers=_headers(), timeout=TIMEOUT_S)
         status = r.status_code
         text_sample = r.text[:800] if isinstance(r.text, str) else ""
         r.raise_for_status()
         j = r.json()
-        if logs_cc: _log_api_call_csv(logs_cc, method="GET", path=path, params=params, status=status, error=None, resp_text=text_sample)
+        _append_api_csv(logs_cc, method="GET", path=path, params=params, status=status, error=None, resp_text=text_sample)
         return j
     except Exception as e:
-        if logs_cc:
-            # pokud máme response, pokusíme se zalogovat status/text
-            status = getattr(e.response, "status_code", "") if hasattr(e, "response") else ""
+        status = getattr(getattr(e, "response", None), "status_code", "")
+        text = ""
+        try:
+            text = e.response.text[:800] if getattr(e, "response", None) is not None else ""
+        except Exception:
             text = ""
-            try:
-                text = e.response.text[:800] if getattr(e, "response", None) is not None else ""
-            except Exception:
-                text = ""
-            _log_api_call_csv(logs_cc, method="GET", path=path, params=params, status=status, error=str(e), resp_text=text)
+        _append_api_csv(logs_cc, method="GET", path=path, params=params, status=status, error=str(e), resp_text=text)
         raise
 
-def api_signed_post(path: str, params: Dict[str, Any], *, logs_cc=None) -> Any:
+def api_signed_post(session: requests.Session, path: str, params: Dict[str, Any], *, logs_cc=None) -> Any:
     p = dict(params)
     p["timestamp"] = _ts()
     p["recvWindow"] = RECV_WINDOW
@@ -258,54 +295,47 @@ def api_signed_post(path: str, params: Dict[str, Any], *, logs_cc=None) -> Any:
     sig = _sign(qs)
     url = f"{BASE_URL}{path}?{qs}&signature={sig}"
     try:
-        r = requests.post(url, headers=_headers(), timeout=TIMEOUT_S)
+        r = session.post(url, headers=_headers(), timeout=TIMEOUT_S)
         status = r.status_code
         text_sample = r.text[:800] if isinstance(r.text, str) else ""
         r.raise_for_status()
         j = r.json()
-        if logs_cc: _log_api_call_csv(logs_cc, method="POST", path=path, params=_sanitize_params(p), status=status, error=None, resp_text=text_sample)
+        _append_api_csv(logs_cc, method="POST", path=path, params=_sanitize_params(p), status=status, error=None, resp_text=text_sample)
         return j
     except Exception as e:
-        if logs_cc:
-            status = getattr(e.response, "status_code", "") if hasattr(e, "response") else ""
+        status = getattr(getattr(e, "response", None), "status_code", "")
+        text = ""
+        try:
+            text = e.response.text[:800] if getattr(e, "response", None) is not None else ""
+        except Exception:
             text = ""
-            try:
-                text = e.response.text[:800] if getattr(e, "response", None) is not None else ""
-            except Exception:
-                text = ""
-            _log_api_call_csv(logs_cc, method="POST", path=path, params=_sanitize_params(p), status=status, error=str(e), resp_text=text)
+        _append_api_csv(logs_cc, method="POST", path=path, params=_sanitize_params(p), status=status, error=str(e), resp_text=text)
         raise
 
-def get_price(symbol: str, *, logs_cc=None) -> float:
-    j = api_get("/api/v3/ticker/price", {"symbol": symbol}, logs_cc=logs_cc)
+def get_price(session: requests.Session, symbol: str, *, logs_cc=None) -> float:
+    j = api_get(session, "/api/v3/ticker/price", {"symbol": symbol}, logs_cc=logs_cc)
     return float(j["price"])
 
-# ---------------------- exchangeInfo cache (1× denně) ----------------------
+# ====================== exchangeInfo cache (1× denně) ======================
 
-def _pairs_from_env(val: str) -> List[str]:
+def _pairs_only(val: str) -> List[str]:
     out = []
     for piece in val.split(","):
         piece = piece.strip()
-        if not piece or ":" not in piece:
-            continue
-        pair, _model = piece.split(":",1)
+        if not piece or ":" not in piece: continue
+        pair, _ = piece.split(":",1)
         out.append(pair.strip().upper())
-    seen = set(); res = []
+    # dedup
+    seen=set(); res=[]
     for p in out:
-        if p not in seen:
-            seen.add(p); res.append(p)
+        if p not in seen: seen.add(p); res.append(p)
     return res
 
 def _exchangeinfo_blob_name_for_today() -> str:
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     return f"exchangeinfo_{today}.json"
 
-def _ensure_exchangeinfo_json_for_today(logs_cc, pairs: List[str]) -> Dict[str, Any]:
-    """
-    Zkus načíst dnešní exchangeinfo JSON z TRADE_LOGS_CONTAINER.
-    Pokud neexistuje, zavolá 1× Binance /api/v3/exchangeInfo se seznamem symbolů,
-    uloží minimalizovaný JSON a vrátí mapu filtrů.
-    """
+def _ensure_exchangeinfo_json_for_today(session: requests.Session, logs_cc, pairs: List[str]) -> Dict[str, Any]:
     blob_name = _exchangeinfo_blob_name_for_today()
     cached = _read_blob_json(logs_cc, blob_name)
     if cached and isinstance(cached, dict) and cached.get("asof_date"):
@@ -313,7 +343,7 @@ def _ensure_exchangeinfo_json_for_today(logs_cc, pairs: List[str]) -> Dict[str, 
         return cached
 
     symbols_param = json.dumps(pairs, separators=(",", ":"))
-    info = api_get("/api/v3/exchangeInfo", {"symbols": symbols_param}, logs_cc=logs_cc)
+    info = api_get(session, "/api/v3/exchangeInfo", {"symbols": symbols_param}, logs_cc=logs_cc)
 
     filt_map: Dict[str, Any] = {}
     for sym in info.get("symbols", []):
@@ -350,10 +380,6 @@ def _ensure_exchangeinfo_json_for_today(logs_cc, pairs: List[str]) -> Dict[str, 
     return payload
 
 def get_symbol_filters_cached(filters_json: Dict[str, Any], symbol: str) -> Tuple[float, float, float, str]:
-    """
-    Vrátí (stepSize, minNotional, tickSize, status) z denního JSONu.
-    Pokud symbol nenajdeme, vrací (0,0,0,"UNKNOWN").
-    """
     entry = (filters_json.get("filters") or {}).get(symbol.upper())
     if not entry:
         return (0.0, 0.0, 0.0, "UNKNOWN")
@@ -368,13 +394,9 @@ def round_down_qty(qty: float, step: float) -> float:
     if step <= 0: return qty
     return math.floor(qty / step) * step
 
-# ---------------------- Orders ----------------------
+# ====================== Orders ======================
 
-def place_market_buy_quote(symbol: str, quote_usdt: float, *, logs_cc=None) -> Dict[str, Any]:
-    """
-    MARKET BUY s přesnou útratou v USDT: quoteOrderQty.
-    Vrací JSON orderu (obsahuje cummulativeQuoteQty, executedQty, fills[]).
-    """
+def place_market_buy_quote(session: requests.Session, symbol: str, quote_usdt: float, *, logs_cc=None) -> Dict[str, Any]:
     params = {
         "symbol": symbol,
         "side": "BUY",
@@ -382,9 +404,9 @@ def place_market_buy_quote(symbol: str, quote_usdt: float, *, logs_cc=None) -> D
         "quoteOrderQty": f"{quote_usdt:.8f}",
         "newOrderRespType": "FULL"
     }
-    return api_signed_post("/api/v3/order", params, logs_cc=logs_cc)
+    return api_signed_post(session, "/api/v3/order", params, logs_cc=logs_cc)
 
-def place_market_sell_qty(symbol: str, qty: float, *, logs_cc=None) -> Dict[str, Any]:
+def place_market_sell_qty(session: requests.Session, symbol: str, qty: float, *, logs_cc=None) -> Dict[str, Any]:
     params = {
         "symbol": symbol,
         "side": "SELL",
@@ -392,18 +414,9 @@ def place_market_sell_qty(symbol: str, qty: float, *, logs_cc=None) -> Dict[str,
         "quantity": f"{qty:.8f}",
         "newOrderRespType": "FULL"
     }
-    return api_signed_post("/api/v3/order", params, logs_cc=logs_cc)
+    return api_signed_post(session, "/api/v3/order", params, logs_cc=logs_cc)
 
-# ---------------------- Bot logic ----------------------
-
-def _parse_pairs_models(val: str) -> List[Tuple[str,str]]:
-    out = []
-    for piece in val.split(","):
-        piece = piece.strip()
-        if not piece or ":" not in piece: continue
-        pair, model = piece.split(":",1)
-        out.append((pair.strip().upper(), model.strip()))
-    return out
+# ====================== Bot core ======================
 
 def _state_blob_name(pair: str, model: str) -> str:
     return f"{pair}_{model}.json"
@@ -432,16 +445,39 @@ def _sum_fee(fills: List[Dict[str,Any]]) -> Tuple[float,str]:
 def _timestamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-def run_tick_for_pair(models_cc, state_cc, logs_cc, pair: str, model: str, exch_cache: Dict[str,Any]):
-    # 1) Signál
-    sig = _load_active_signal_for(models_cc, pair, model)
-    if not sig:
+def _fetch_prices_parallel(session: requests.Session, logs_cc, pairs: List[str]) -> Dict[str, float]:
+    """
+    Stáhne /ticker/price pro všechny páry paralelně, vrátí mapu {pair: price}.
+    """
+    prices: Dict[str,float] = {}
+    def task(pair: str):
+        return pair, get_price(session, pair, logs_cc=logs_cc)
+
+    with ThreadPoolExecutor(max_workers=max(1, PRICE_FETCH_WORKERS)) as ex:
+        futs = { ex.submit(task, p): p for p in pairs }
+        for fut in as_completed(futs):
+            p = futs[fut]
+            try:
+                sym, price = fut.result()
+                prices[sym] = price
+            except Exception as e:
+                logger.warning("[%s] price fetch failed: %s", p, e)
+    return prices
+
+def run_decision_for_pair(session: requests.Session,
+                          models_cc, state_cc, logs_cc,
+                          pair: str, model: str,
+                          sig_row: Optional[Dict[str,Any]],
+                          exch_cache: Dict[str,Any],
+                          current_price: Optional[float]) -> None:
+    # pokud nemáme platný signál, přeskoč
+    if not sig_row:
         logger.info("[%s/%s] No active signal passing thresholds — skipping.", pair, model)
         return
 
-    B = float(sig["B"]); S = float(sig["S"])
+    B = float(sig_row["B"]); S = float(sig_row["S"])
 
-    # 2) Stav
+    # načti stav
     s_name = _state_blob_name(pair, model)
     st = _read_blob_json(state_cc, s_name) or {
         "position": "flat",
@@ -452,20 +488,19 @@ def run_tick_for_pair(models_cc, state_cc, logs_cc, pair: str, model: str, exch_
         "signal_date": None
     }
 
-    # 3) aktuální cena
-    try:
-        px = get_price(pair, logs_cc=logs_cc)
-    except Exception as e:
-        logger.warning("[%s] price failed: %s", pair, e)
+    # cena
+    if current_price is None:
+        logger.warning("[%s/%s] Missing current price → skip.", pair, model)
         return
+    px = float(current_price)
 
-    # 4) Filtry symbolu z denního JSONu
-    step, min_notional, tick, status = get_symbol_filters_cached(exch_cache, pair)
+    # filtry
+    step, min_notional, _tick, status = get_symbol_filters_cached(exch_cache, pair)
     if status and status != "TRADING":
         logger.info("[%s/%s] status=%s → skipping trading", pair, model, status)
         return
 
-    # 5) SELL podmínka
+    # SELL
     if st["position"] == "long" and px >= (st.get("s_level") or S):
         qty_sell = round_down_qty(float(st["qty"]), step)
         if qty_sell <= 0:
@@ -480,7 +515,7 @@ def run_tick_for_pair(models_cc, state_cc, logs_cc, pair: str, model: str, exch_
             return
 
         try:
-            odr = place_market_sell_qty(pair, qty_sell, logs_cc=logs_cc)
+            odr = place_market_sell_qty(session, pair, qty_sell, logs_cc=logs_cc)
         except Exception as e:
             logger.warning("[%s/%s] SELL order failed: %s", pair, model, e)
             return
@@ -511,14 +546,14 @@ def run_tick_for_pair(models_cc, state_cc, logs_cc, pair: str, model: str, exch_
         logger.info("[%s/%s] SELL filled qty=%s avg=%.6f cq=%.6f", pair, model, executed_qty, avgp, cq)
         return
 
-    # 6) BUY podmínka
+    # BUY
     if st["position"] == "flat" and px <= B:
         if min_notional and ORDER_USDT < min_notional:
             logger.info("[%s/%s] BUY under minNotional (%.4f < %.4f) → skip",
                         pair, model, ORDER_USDT, min_notional)
             return
         try:
-            odr = place_market_buy_quote(pair, ORDER_USDT, logs_cc=logs_cc)
+            odr = place_market_buy_quote(session, pair, ORDER_USDT, logs_cc=logs_cc)
         except Exception as e:
             logger.warning("[%s/%s] BUY order failed: %s", pair, model, e)
             return
@@ -539,7 +574,7 @@ def run_tick_for_pair(models_cc, state_cc, logs_cc, pair: str, model: str, exch_
             str(odr.get("orderId","")),
             f"{B:.8f}",
             f"{S:.8f}",
-            str(sig.get("date") or "")
+            str(sig_row.get("date") or "")
         ]) + "\n"
         _append_trade_line(logs_cc, _trade_log_blob_name(pair), line)
 
@@ -550,7 +585,7 @@ def run_tick_for_pair(models_cc, state_cc, logs_cc, pair: str, model: str, exch_
             "entry_quote": cq,
             "b_level": B,
             "s_level": S,
-            "signal_date": sig.get("date")
+            "signal_date": sig_row.get("date")
         }
         _write_blob_json(state_cc, s_name, st)
         logger.info("[%s/%s] BUY filled qty=%s avg=%.6f cq=%.6f", pair, model, executed_qty, avgp, cq)
@@ -558,22 +593,39 @@ def run_tick_for_pair(models_cc, state_cc, logs_cc, pair: str, model: str, exch_
 
     logger.info("[%s/%s] No action. px=%.6f B=%.6f S=%.6f pos=%s", pair, model, px, B, S, st["position"])
 
-# ---------------------- Azure Function entry ----------------------
+# ====================== Azure Function entry ======================
 
 def main(mytimer: func.TimerRequest) -> None:
     try:
         _, models_cc, state_cc, logs_cc = _make_blob_clients()
 
-        # 0) Připrav páry a denní exchangeInfo cache (1× denně JSON v TRADE_LOGS)
+        # 0) Parsuj páry/modely + výpis pro diagnózu
         pairs_models = _parse_pairs_models(TRADE_PAIRS_MODELS)
         if not pairs_models:
             logger.error("TRADE_PAIRS_MODELS is empty"); return
         pairs = sorted({p for (p, _m) in pairs_models})
-        exchangeinfo_today = _ensure_exchangeinfo_json_for_today(logs_cc, pairs)
+        logger.info("Parsed %d pairs, %d pair-model combos", len(pairs), len(pairs_models))
 
-        # 1) Tik pro každý (pair, model)
+        # 1) Session reuse
+        session = requests.Session()
+
+        # 2) exchangeInfo cache 1× denně
+        exchangeinfo_today = _ensure_exchangeinfo_json_for_today(session, logs_cc, pairs)
+
+        # 3) master CSV load 1× za tik
+        sig_map = _load_master_signals_map(models_cc)
+
+        # 4) ceny paralelně
+        prices = _fetch_prices_parallel(session, logs_cc, pairs)
+
+        # 5) rozhodnutí per pair-model (sekvenčně; ordery řešíme jednotlivě)
+        start = time.time()
         for pair, model in pairs_models:
-            run_tick_for_pair(models_cc, state_cc, logs_cc, pair, model, exchangeinfo_today)
+            sig_row = sig_map.get((pair, model))
+            price = prices.get(pair)
+            run_decision_for_pair(session, models_cc, state_cc, logs_cc, pair, model, sig_row, exchangeinfo_today, price)
+        dur = time.time() - start
+        logger.info("Tick finished in %.2fs for %d pairs", dur, len(pairs))
 
     except Exception:
         logger.exception("[BinanceTradeBot] Unhandled exception in main()")
