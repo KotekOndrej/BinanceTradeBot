@@ -10,6 +10,7 @@ import urllib.parse
 from datetime import datetime, timezone
 from typing import Dict, Any, Tuple, Optional, List
 
+
 import azure.functions as func
 
 # ---------------------- ENV ----------------------
