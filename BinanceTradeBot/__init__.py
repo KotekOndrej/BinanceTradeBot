@@ -4,6 +4,7 @@ import hmac
 import json
 import time
 import math
+import csv
 import hashlib
 import logging
 import urllib.parse
@@ -65,6 +66,18 @@ logger = logging.getLogger("BinanceTradeBot")
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
 
+# ====================== CSV helpers ======================
+
+def _csv_line(values: List[Any]) -> str:
+    """Vrátí 1 CSV řádek (s newline) pomocí csv.writer (správný quoting)."""
+    sio = io.StringIO()
+    w = csv.writer(sio, lineterminator="\n")
+    w.writerow(values)
+    return sio.getvalue()
+
+def _csv_header(columns: List[str]) -> str:
+    return _csv_line(columns)
+
 # ====================== Azure Blob helpers ======================
 
 def _make_blob_clients():
@@ -100,22 +113,19 @@ def _write_blob_json(cc, name: str, obj: Dict[str, Any]) -> None:
 
 # --- AppendBlob utility (skutečný append + migrace starých blobů) ---
 
-def _ensure_append_blob_with_header(container_client, blob_name: str, header: str):
+def _ensure_append_blob_with_header(container_client, blob_name: str, header_csv: str):
     """
-    Zajistí, že cílový blob:
-      - existuje jako AppendBlob
-      - obsahuje hlavičku (pokud chybí, provede MIGRACI)
-      - pokud blob existuje jako BlockBlob → stáhni, smaž, vytvoř AppendBlob, zapiš hlavičku + původní obsah
+    Zajistí AppendBlob s hlavičkou (CSV). Pokud blob existuje bez hlavičky, jednorázově doplní.
+    Pokud byl BlockBlob, zmigruje na AppendBlob.
     """
     from azure.core.exceptions import ResourceNotFoundError
 
     bc = container_client.get_blob_client(blob_name)
     try:
         props = bc.get_blob_properties()
-        # načíst pár bytů kvůli hlavičce
         head = b""
         try:
-            head = bc.download_blob(offset=0, length=max(256, len(header))).readall()
+            head = bc.download_blob(offset=0, length=max(256, len(header_csv))).readall()
         except Exception:
             head = b""
 
@@ -126,52 +136,54 @@ def _ensure_append_blob_with_header(container_client, blob_name: str, header: st
             full = bc.download_blob().readall()
             bc.delete_blob()
             bc.create_append_blob()
-            if header:
-                bc.append_block(header.encode("utf-8"))
+            if header_csv:
+                bc.append_block(header_csv.encode("utf-8"))
             if full:
                 bc.append_block(full)
             return bc
 
-        # je to AppendBlob → doplň hlavičku, pokud chybí
-        if header:
-            text = ""
+        # Je to AppendBlob → doplň hlavičku pokud chybí
+        if header_csv:
             try:
                 text = head.decode("utf-8", errors="ignore")
             except Exception:
                 text = ""
             if size == 0:
-                bc.append_block(header.encode("utf-8"))
-            elif not text.startswith(header):
+                bc.append_block(header_csv.encode("utf-8"))
+            elif not text.startswith(header_csv):
                 full = bc.download_blob().readall()
                 bc.delete_blob()
                 bc.create_append_blob()
-                bc.append_block(header.encode("utf-8"))
+                bc.append_block(header_csv.encode("utf-8"))
                 if full:
                     bc.append_block(full)
         return bc
 
     except ResourceNotFoundError:
         bc.create_append_blob()
-        if header:
-            bc.append_block(header.encode("utf-8"))
+        if header_csv:
+            bc.append_block(header_csv.encode("utf-8"))
         return bc
 
-def _append_line_append_blob(container_client, blob_name: str, line: str, header: str = ""):
+def _append_csv_row(container_client, blob_name: str, header_cols: List[str], row_values: List[Any]):
+    header = _csv_header(header_cols)
+    line   = _csv_line(row_values)
     bc = _ensure_append_blob_with_header(container_client, blob_name, header)
     bc.append_block(line.encode("utf-8"))
 
-# ====================== API call CSV logging (AppendBlob) ======================
+# ====================== API call CSV logging ======================
+
+API_LOG_COLUMNS = ["ts","method","path","params","status","error","resp_sample"]
+
+def _sanitize_params(p: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(p, dict): return {}
+    cleaned = dict(p)
+    cleaned.pop("signature", None)
+    return cleaned
 
 def _api_csv_blob_name() -> str:
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     return f"api_calls_{today}.csv"
-
-def _sanitize_params(p: Dict[str, Any]) -> Dict[str, Any]:
-    if not isinstance(p, dict):
-        return {}
-    cleaned = dict(p)
-    cleaned.pop("signature", None)
-    return cleaned
 
 def _append_api_csv(logs_cc, *, method: str, path: str, params: Dict[str, Any], status: Any, error: Optional[str], resp_text: Optional[str]):
     if not API_CSV_LOGGING:
@@ -180,17 +192,16 @@ def _append_api_csv(logs_cc, *, method: str, path: str, params: Dict[str, Any], 
     resp_sample = (resp_text or "")
     if isinstance(resp_sample, str) and len(resp_sample) > 1000:
         resp_sample = resp_sample[:1000] + "..."
-    line = ",".join([
+    row = [
         datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         method,
         path,
-        params_ser.replace("\n"," ").replace("\r"," "),
+        params_ser,
         str(status or ""),
-        (error or "").replace("\n"," ").replace("\r"," "),
-        resp_sample.replace("\n"," ").replace("\r"," ")
-    ]) + "\n"
-    header = "ts,method,path,params,status,error,resp_sample\n"
-    _append_line_append_blob(logs_cc, _api_csv_blob_name(), line, header=header)
+        (error or ""),
+        resp_sample
+    ]
+    _append_csv_row(logs_cc, _api_csv_blob_name(), API_LOG_COLUMNS, row)
 
 # ====================== Master CSV loader (1× za tik) ======================
 
@@ -332,10 +343,6 @@ def _pairs_only(val: str) -> List[str]:
 
 def _exchangeinfo_blob_name_for_today() -> str:
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    return f"exchangeinfo_{today}.csv"  # JSON obsah uložíme jako CSV? Ne, stále JSON – jen název určuješ ty. Nechám JSON:
-    # POZN.: Pokud trváš na CSV náhledu i pro exchangeInfo, změň řádek výše a serializaci níže. Níže ponechávám JSON.
-def _exchangeinfo_blob_name_for_today() -> str:
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     return f"exchangeinfo_{today}.json"
 
 def _ensure_exchangeinfo_json_for_today(session: requests.Session, logs_cc, pairs: List[str]) -> Dict[str, Any]:
@@ -427,8 +434,12 @@ def _state_blob_name(pair: str, model: str) -> str:
 def _trade_log_blob_name(pair: str) -> str:
     return f"{pair}.csv"
 
-def _trade_header() -> str:
-    return "time_utc,pair,model,side,executedQty,avgFillPrice,cummulativeQuoteQty,fee_total,fee_asset,orderId,b_level,s_level,b_signal_date\n"
+TRADE_LOG_COLUMNS = [
+    "time_utc","pair","model","side",
+    "executedQty","avgFillPrice","cummulativeQuoteQty",
+    "fee_total","fee_asset","orderId",
+    "b_level","s_level","b_signal_date"
+]
 
 def _avg_fill_price(fills: List[Dict[str,Any]]) -> float:
     if not fills: return 0.0
@@ -451,8 +462,8 @@ def _sum_fee(fills: List[Dict[str,Any]]) -> Tuple[float,str]:
 def _timestamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-def _ensure_trade_log_header_and_append(logs_cc, pair: str, line: str):
-    _append_line_append_blob(logs_cc, _trade_log_blob_name(pair), line, header=_trade_header())
+def _append_trade_row(logs_cc, pair: str, row_values: List[Any]):
+    _append_csv_row(logs_cc, _trade_log_blob_name(pair), TRADE_LOG_COLUMNS, row_values)
 
 def _fetch_prices_parallel(session: requests.Session, logs_cc, pairs: List[str]) -> Dict[str, float]:
     prices: Dict[str,float] = {}
@@ -503,7 +514,8 @@ def run_decision_for_pair(session: requests.Session,
 
     # SELL
     if st["position"] == "long" and px >= (st.get("s_level") or S):
-        qty_sell = round_down_qty(float(st["qty"]), step)
+        qty_sell = max(0.0, float(st["qty"]))
+        qty_sell = round_down_qty(qty_sell, step)
         if qty_sell <= 0:
             st = { "position":"flat", "qty":0.0, "entry_price":None, "entry_quote":0.0,
                    "b_level":None, "s_level":None, "signal_date":None }
@@ -527,7 +539,7 @@ def run_decision_for_pair(session: requests.Session,
         avgp = _avg_fill_price(fills)
         fee_total, fee_asset = _sum_fee(fills)
 
-        line = ",".join([
+        _append_trade_row(logs_cc, pair, [
             _timestamp(), pair, model, "SELL",
             f"{executed_qty:.8f}",
             f"{avgp:.8f}",
@@ -538,8 +550,7 @@ def run_decision_for_pair(session: requests.Session,
             f"{st.get('b_level',0.0):.8f}",
             f"{st.get('s_level',0.0):.8f}",
             str(st.get("signal_date") or "")
-        ]) + "\n"
-        _ensure_trade_log_header_and_append(logs_cc, pair, line)
+        ])
 
         st = { "position":"flat", "qty":0.0, "entry_price":None, "entry_quote":0.0,
                "b_level":None, "s_level":None, "signal_date":None }
@@ -565,7 +576,7 @@ def run_decision_for_pair(session: requests.Session,
         avgp = _avg_fill_price(fills)
         fee_total, fee_asset = _sum_fee(fills)
 
-        line = ",".join([
+        _append_trade_row(logs_cc, pair, [
             _timestamp(), pair, model, "BUY",
             f"{executed_qty:.8f}",
             f"{avgp:.8f}",
@@ -576,8 +587,7 @@ def run_decision_for_pair(session: requests.Session,
             f"{B:.8f}",
             f"{S:.8f}",
             str(sig_row.get("date") or "")
-        ]) + "\n"
-        _ensure_trade_log_header_and_append(logs_cc, pair, line)
+        ])
 
         st = {
             "position": "long",
@@ -596,13 +606,14 @@ def run_decision_for_pair(session: requests.Session,
 
 # ====================== Heartbeat (CSV) ======================
 
+DIAG_COLUMNS = ["ts","message"]
+
 def _diag_heartbeat_csv(logs_cc, message: str):
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     blob_name = f"run_diag_{today}.csv"
-    header = "ts,message\n"
-    line = ",".join([datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                     message.replace("\n"," ").replace("\r"," ")]) + "\n"
-    _append_line_append_blob(logs_cc, blob_name, line, header=header)
+    row = [datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+           message]
+    _append_csv_row(logs_cc, blob_name, DIAG_COLUMNS, row)
 
 # ====================== Azure Function entry ======================
 
@@ -610,7 +621,6 @@ def main(mytimer: func.TimerRequest) -> None:
     try:
         _, models_cc, state_cc, logs_cc = _make_blob_clients()
 
-        # Heartbeat do CSV
         _diag_heartbeat_csv(logs_cc, f"start tick; base_url={BINANCE_BASE_URL}")
 
         pairs_models = _parse_pairs_models(TRADE_PAIRS_MODELS)
