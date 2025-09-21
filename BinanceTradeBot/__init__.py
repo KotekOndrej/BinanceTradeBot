@@ -65,7 +65,7 @@ ORDER_USDT             = _get_float("ORDER_USDT", 10.0)   # MARKET BUY utratí p
 # Binance API (BASE URL z env; žádný USE_TESTNET)
 BINANCE_API_KEY        = _get_env("BINANCE_API_KEY", required=True)
 BINANCE_API_SECRET     = _get_env("BINANCE_API_SECRET", required=True)
-BINANCE_BASE_URL       = _get_env_any("binance_base_url", "https://api.binance.com", required=False).rstrip("/")
+BINANCE_BASE_URL       = _get_env_any("BINANCE_BASE_URL", "https://api.binance.com", required=False).rstrip("/")
 RECV_WINDOW            = _get_int("BINANCE_RECV_WINDOW", 5000)
 TIMEOUT_S              = _get_int("BINANCE_HTTP_TIMEOUT", 15)
 
