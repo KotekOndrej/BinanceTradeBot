@@ -65,7 +65,6 @@ logger = logging.getLogger("BinanceTradeBot")
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
 
-
 # ====================== Azure Blob helpers ======================
 
 def _make_blob_clients():
@@ -109,46 +108,40 @@ def _ensure_append_blob_with_header(container_client, blob_name: str, header: st
       - pokud blob existuje jako BlockBlob → stáhni, smaž, vytvoř AppendBlob, zapiš hlavičku + původní obsah
     """
     from azure.core.exceptions import ResourceNotFoundError
-    from azure.storage.blob import BlobProperties
 
     bc = container_client.get_blob_client(blob_name)
     try:
-        props: BlobProperties = bc.get_blob_properties()
-        # Pokud blob existuje, zjisti typ pomocí x-ms-blob-type
-        blob_type = str(getattr(props, "blob_type", "")).lower()
-        # Načti prvních pár bytů kvůli hlavičce
+        props = bc.get_blob_properties()
+        # načíst pár bytů kvůli hlavičce
         head = b""
         try:
             head = bc.download_blob(offset=0, length=max(256, len(header))).readall()
         except Exception:
             head = b""
 
+        blob_type = str(getattr(props, "blob_type", "")).lower()
+        size = int(getattr(props, "size", 0) or 0)
+
         if blob_type != "appendblob":
-            # MIGRACE z BlockBlob (nebo jiného typu)
             full = bc.download_blob().readall()
             bc.delete_blob()
             bc.create_append_blob()
             if header:
                 bc.append_block(header.encode("utf-8"))
             if full:
-                # Pokud starý obsah neměl hlavičku, doplníme ji (detekce níže)
-                if header and (not head or not head.decode("utf-8", errors="ignore").startswith(header)):
-                    bc.append_block(full)  # starý obsah byl bez hlavičky → přidáme po hlavičce
-                else:
-                    bc.append_block(full)
+                bc.append_block(full)
             return bc
 
-        # Je to už AppendBlob: doplň hlavičku, pokud chybí
+        # je to AppendBlob → doplň hlavičku, pokud chybí
         if header:
+            text = ""
             try:
                 text = head.decode("utf-8", errors="ignore")
             except Exception:
                 text = ""
-            size = int(getattr(props, "size", 0) or 0)
             if size == 0:
                 bc.append_block(header.encode("utf-8"))
             elif not text.startswith(header):
-                # Migrace: stáhnout celé, smazat, vytvořit Append + hlavička + původní obsah
                 full = bc.download_blob().readall()
                 bc.delete_blob()
                 bc.create_append_blob()
@@ -158,22 +151,14 @@ def _ensure_append_blob_with_header(container_client, blob_name: str, header: st
         return bc
 
     except ResourceNotFoundError:
-        # Blob neexistuje → založ AppendBlob s hlavičkou
         bc.create_append_blob()
         if header:
             bc.append_block(header.encode("utf-8"))
         return bc
-    except Exception as e:
-        logger.exception("[blob] ensure_append_blob_with_header failed for %s: %s", blob_name, e)
-        raise
 
 def _append_line_append_blob(container_client, blob_name: str, line: str, header: str = ""):
-    try:
-        bc = _ensure_append_blob_with_header(container_client, blob_name, header)
-        bc.append_block(line.encode("utf-8"))
-    except Exception as e:
-        logger.exception("[blob] append failed for %s: %s", blob_name, e)
-        raise
+    bc = _ensure_append_blob_with_header(container_client, blob_name, header)
+    bc.append_block(line.encode("utf-8"))
 
 # ====================== API call CSV logging (AppendBlob) ======================
 
@@ -242,25 +227,20 @@ def _load_master_signals_map(models_cc) -> Dict[Tuple[str,str], Dict[str,Any]]:
     if cycles_col is None:
         logger.error("Master CSV musí obsahovat 'cycles' nebo 'total_cycles'."); return {}
 
-    # normalizace
     df["pair"] = df["pair"].astype(str).str.upper()
     df["model"] = df["model"].astype(str)
 
-    # filtry
     df = df[(df["is_active"]==True) &
             (df[cycles_col] >= MIN_CYCLES_PER_DAY) &
             (df["score"]  >= MIN_SCORE)].copy()
     if df.empty:
         return {}
 
-    # parse čas
     df["load_time_utc"] = pd.to_datetime(df["load_time_utc"], errors="coerce", utc=True)
 
-    # vezmi poslední per (pair, model)
     df = df.sort_values(["pair","model","date","load_time_utc"])
     latest = df.groupby(["pair","model"], as_index=False).tail(1)
 
-    # výstupní mapa
     out: Dict[Tuple[str,str], Dict[str,Any]] = {}
     for _, r in latest.iterrows():
         key = (str(r["pair"]).upper(), str(r["model"]))
@@ -345,12 +325,15 @@ def _pairs_only(val: str) -> List[str]:
         if not piece or ":" not in piece: continue
         pair, _ = piece.split(":",1)
         out.append(pair.strip().upper())
-    # dedup
     seen=set(); res=[]
     for p in out:
         if p not in seen: seen.add(p); res.append(p)
     return res
 
+def _exchangeinfo_blob_name_for_today() -> str:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return f"exchangeinfo_{today}.csv"  # JSON obsah uložíme jako CSV? Ne, stále JSON – jen název určuješ ty. Nechám JSON:
+    # POZN.: Pokud trváš na CSV náhledu i pro exchangeInfo, změň řádek výše a serializaci níže. Níže ponechávám JSON.
 def _exchangeinfo_blob_name_for_today() -> str:
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     return f"exchangeinfo_{today}.json"
@@ -611,16 +594,15 @@ def run_decision_for_pair(session: requests.Session,
 
     logger.info("[%s/%s] No action. px=%.6f B=%.6f S=%.6f pos=%s", pair, model, px, B, S, st["position"])
 
-# ====================== Heartbeat (diagnostika) ======================
+# ====================== Heartbeat (CSV) ======================
 
-def _diag_heartbeat(logs_cc, msg: str):
-    try:
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        blob_name = f"run_diag_{today}.log"
-        line = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") + " " + msg + "\n"
-        _append_line_append_blob(logs_cc, blob_name, line, header="")
-    except Exception as e:
-        logger.warning("[diag] heartbeat write failed: %s", e)
+def _diag_heartbeat_csv(logs_cc, message: str):
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    blob_name = f"run_diag_{today}.csv"
+    header = "ts,message\n"
+    line = ",".join([datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                     message.replace("\n"," ").replace("\r"," ")]) + "\n"
+    _append_line_append_blob(logs_cc, blob_name, line, header=header)
 
 # ====================== Azure Function entry ======================
 
@@ -628,17 +610,17 @@ def main(mytimer: func.TimerRequest) -> None:
     try:
         _, models_cc, state_cc, logs_cc = _make_blob_clients()
 
-        # Heartbeat: vždy něco zapíšeme, ať je vidět, že funkce běží a máme práva na zápis
-        _diag_heartbeat(logs_cc, "start tick; base_url=" + BINANCE_BASE_URL)
+        # Heartbeat do CSV
+        _diag_heartbeat_csv(logs_cc, f"start tick; base_url={BINANCE_BASE_URL}")
 
         pairs_models = _parse_pairs_models(TRADE_PAIRS_MODELS)
         if not pairs_models:
             logger.error("TRADE_PAIRS_MODELS is empty")
-            _diag_heartbeat(logs_cc, "ERROR: empty TRADE_PAIRS_MODELS")
+            _diag_heartbeat_csv(logs_cc, "ERROR: empty TRADE_PAIRS_MODELS")
             return
         pairs = sorted({p for (p, _m) in pairs_models})
         logger.info("Parsed %d pairs, %d pair-model combos", len(pairs), len(pairs_models))
-        _diag_heartbeat(logs_cc, f"pairs={len(pairs)} combos={len(pairs_models)}")
+        _diag_heartbeat_csv(logs_cc, f"pairs={len(pairs)} combos={len(pairs_models)}")
 
         session = requests.Session()
 
@@ -653,14 +635,13 @@ def main(mytimer: func.TimerRequest) -> None:
             run_decision_for_pair(session, models_cc, state_cc, logs_cc, pair, model, sig_row, exchangeinfo_today, price)
         dur = time.time() - start
         logger.info("Tick finished in %.2fs for %d pairs (base_url=%s)", dur, len(pairs), BINANCE_BASE_URL)
-        _diag_heartbeat(logs_cc, f"tick ok; pairs={len(pairs)} dur={dur:.2f}s")
+        _diag_heartbeat_csv(logs_cc, f"tick ok; pairs={len(pairs)} dur={dur:.2f}s")
 
     except Exception:
         logger.exception("[BinanceTradeBot] Unhandled exception in main()")
-        # zapiš do diag logu i když to spadne
         try:
             _, _, _, logs_cc = _make_blob_clients()
-            _diag_heartbeat(logs_cc, "EXCEPTION in main()")
+            _diag_heartbeat_csv(logs_cc, "EXCEPTION in main()")
         except Exception:
             pass
         raise
