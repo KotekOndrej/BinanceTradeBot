@@ -22,18 +22,6 @@ def _get_env(name: str, default: Optional[str] = None, required: bool = False) -
         raise RuntimeError(f"Missing env var: {name}")
     return v
 
-def _get_env_any(lower_name: str, default: Optional[str] = None, required: bool = False) -> str:
-    """
-    Přečte preferovaně lower-case název (např. 'binance_base_url'),
-    ale akceptuje i UPPER variantu (např. 'BINANCE_BASE_URL') pro kompatibilitu.
-    """
-    v = os.getenv(lower_name, None)
-    if v is None:
-        v = os.getenv(lower_name.upper(), default)
-    if required and (v is None or str(v).strip() == ""):
-        raise RuntimeError(f"Missing env var: {lower_name}")
-    return v
-
 def _get_float(name: str, default: float) -> float:
     try: return float(os.getenv(name, str(default)))
     except: return default
@@ -62,16 +50,18 @@ MIN_SCORE              = _get_float("MIN_SCORE", 0.0)
 # Objednávky
 ORDER_USDT             = _get_float("ORDER_USDT", 10.0)   # MARKET BUY utratí přesně tuto částku (quoteOrderQty)
 
-# Binance API (BASE URL z env; žádný USE_TESTNET)
+# Binance API
 BINANCE_API_KEY        = _get_env("BINANCE_API_KEY", required=True)
 BINANCE_API_SECRET     = _get_env("BINANCE_API_SECRET", required=True)
-BINANCE_BASE_URL       = _get_env_any("BINANCE_BASE_URL", "https://api.binance.com", required=False).rstrip("/")
+USE_TESTNET            = (_get_env("BINANCE_TESTNET", "true").lower() in ("1","true","yes"))
 RECV_WINDOW            = _get_int("BINANCE_RECV_WINDOW", 5000)
 TIMEOUT_S              = _get_int("BINANCE_HTTP_TIMEOUT", 15)
 
 # výkon
 PRICE_FETCH_WORKERS    = _get_int("PRICE_FETCH_WORKERS", 10)  # paralelní vlákna pro ticker/price
 API_CSV_LOGGING        = _get_bool("API_CSV_LOGGING", True)   # vypnout na produkci lze 0/false
+
+BASE_URL = "https://testnet.binance.vision" if USE_TESTNET else "https://api.binance.com"
 
 logger = logging.getLogger("BinanceTradeBot")
 if not logger.handlers:
@@ -188,24 +178,31 @@ def _load_master_signals_map(models_cc) -> Dict[Tuple[str,str], Dict[str,Any]]:
     if not required.issubset(df.columns):
         logger.error("Master CSV missing columns, have: %s", df.columns.tolist()); return {}
 
+    # alias pro počet cyklů
     cycles_col = "cycles" if "cycles" in df.columns else ("total_cycles" if "total_cycles" in df.columns else None)
     if cycles_col is None:
         logger.error("Master CSV musí obsahovat 'cycles' nebo 'total_cycles'."); return {}
 
+    # normalizace
     df["pair"] = df["pair"].astype(str).str.upper()
     df["model"] = df["model"].astype(str)
 
+    # filtry
     df = df[(df["is_active"]==True) &
             (df[cycles_col] >= MIN_CYCLES_PER_DAY) &
             (df["score"]  >= MIN_SCORE)].copy()
     if df.empty:
         return {}
 
+    # parse čas
+    import pandas as pd
     df["load_time_utc"] = pd.to_datetime(df["load_time_utc"], errors="coerce", utc=True)
 
+    # vezmi poslední per (pair, model)
     df = df.sort_values(["pair","model","date","load_time_utc"])
     latest = df.groupby(["pair","model"], as_index=False).tail(1)
 
+    # výstupní mapa
     out: Dict[Tuple[str,str], Dict[str,Any]] = {}
     for _, r in latest.iterrows():
         key = (str(r["pair"]).upper(), str(r["model"]))
@@ -233,7 +230,7 @@ def _headers() -> Dict[str,str]:
     return {"X-MBX-APIKEY": BINANCE_API_KEY}
 
 def api_get(session: requests.Session, path: str, params: Dict[str, Any], *, logs_cc=None) -> Any:
-    url = f"{BINANCE_BASE_URL}{path}"
+    url = f"{BASE_URL}{path}"
     try:
         r = session.get(url, params=params, headers=_headers(), timeout=TIMEOUT_S)
         status = r.status_code
@@ -258,7 +255,7 @@ def api_signed_post(session: requests.Session, path: str, params: Dict[str, Any]
     p["recvWindow"] = RECV_WINDOW
     qs = urllib.parse.urlencode(p, doseq=True)
     sig = _sign(qs)
-    url = f"{BINANCE_BASE_URL}{path}?{qs}&signature={sig}"
+    url = f"{BASE_URL}{path}?{qs}&signature={sig}"
     try:
         r = session.post(url, headers=_headers(), timeout=TIMEOUT_S)
         status = r.status_code
@@ -290,6 +287,7 @@ def _pairs_only(val: str) -> List[str]:
         if not piece or ":" not in piece: continue
         pair, _ = piece.split(":",1)
         out.append(pair.strip().upper())
+    # dedup
     seen=set(); res=[]
     for p in out:
         if p not in seen: seen.add(p); res.append(p)
@@ -439,12 +437,14 @@ def run_decision_for_pair(session: requests.Session,
                           sig_row: Optional[Dict[str,Any]],
                           exch_cache: Dict[str,Any],
                           current_price: Optional[float]) -> None:
+    # pokud nemáme platný signál, přeskoč
     if not sig_row:
         logger.info("[%s/%s] No active signal passing thresholds — skipping.", pair, model)
         return
 
     B = float(sig_row["B"]); S = float(sig_row["S"])
 
+    # načti stav
     s_name = _state_blob_name(pair, model)
     st = _read_blob_json(state_cc, s_name) or {
         "position": "flat",
@@ -455,11 +455,13 @@ def run_decision_for_pair(session: requests.Session,
         "signal_date": None
     }
 
+    # cena
     if current_price is None:
         logger.warning("[%s/%s] Missing current price → skip.", pair, model)
         return
     px = float(current_price)
 
+    # filtry
     step, min_notional, _tick, status = get_symbol_filters_cached(exch_cache, pair)
     if status and status != "TRADING":
         logger.info("[%s/%s] status=%s → skipping trading", pair, model, status)
@@ -564,27 +566,33 @@ def main(mytimer: func.TimerRequest) -> None:
     try:
         _, models_cc, state_cc, logs_cc = _make_blob_clients()
 
+        # 0) páry/modely
         pairs_models = _parse_pairs_models(TRADE_PAIRS_MODELS)
         if not pairs_models:
             logger.error("TRADE_PAIRS_MODELS is empty"); return
         pairs = sorted({p for (p, _m) in pairs_models})
         logger.info("Parsed %d pairs, %d pair-model combos", len(pairs), len(pairs_models))
 
+        # 1) Session reuse
         session = requests.Session()
 
+        # 2) exchangeInfo cache 1× denně
         exchangeinfo_today = _ensure_exchangeinfo_json_for_today(session, logs_cc, pairs)
 
+        # 3) master CSV load 1× za tik
         sig_map = _load_master_signals_map(models_cc)
 
+        # 4) ceny paralelně
         prices = _fetch_prices_parallel(session, logs_cc, pairs)
 
+        # 5) rozhodnutí per pair-model
         start = time.time()
         for pair, model in pairs_models:
             sig_row = sig_map.get((pair, model))
             price = prices.get(pair)
             run_decision_for_pair(session, models_cc, state_cc, logs_cc, pair, model, sig_row, exchangeinfo_today, price)
         dur = time.time() - start
-        logger.info("Tick finished in %.2fs for %d pairs (base_url=%s)", dur, len(pairs), BINANCE_BASE_URL)
+        logger.info("Tick finished in %.2fs for %d pairs", dur, len(pairs))
 
     except Exception:
         logger.exception("[BinanceTradeBot] Unhandled exception in main()")
