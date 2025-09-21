@@ -48,7 +48,7 @@ MIN_CYCLES_PER_DAY     = _get_int("MIN_CYCLES_PER_DAY", 1)
 MIN_SCORE              = _get_float("MIN_SCORE", 0.0)
 
 # Objednávky
-ORDER_USDT             = _get_float("ORDER_USDT", 10.0)   # MARKET BUY utratí přesně tuto částku (quoteOrderQty)
+ORDER_USDT             = _get_float("ORDER_USDT", 10.0)   # Market BUY utratí přesně tuto částku (quoteOrderQty)
 
 # Binance API
 BINANCE_API_KEY        = _get_env("BINANCE_API_KEY", required=True)
@@ -59,7 +59,7 @@ TIMEOUT_S              = _get_int("BINANCE_HTTP_TIMEOUT", 15)
 
 # výkon
 PRICE_FETCH_WORKERS    = _get_int("PRICE_FETCH_WORKERS", 10)  # paralelní vlákna pro ticker/price
-API_CSV_LOGGING        = _get_bool("API_CSV_LOGGING", True)   # vypnout na produkci lze 0/false
+API_CSV_LOGGING        = _get_bool("API_CSV_LOGGING", True)   # vypnout na produkci lze nastavením 0/false
 
 BASE_URL = "https://testnet.binance.vision" if USE_TESTNET else "https://api.binance.com"
 
@@ -98,28 +98,65 @@ def _write_blob_json(cc, name: str, obj: Dict[str, Any]) -> None:
         overwrite=True
     )
 
-# --- AppendBlob utility (skutečný append, žádné přepisování) ---
-
-def _ensure_append_blob_with_header(container_client, blob_name: str, header: str):
+# --- Append řádek do textového blobu přes block list (bez download) ---
+def _append_text_blob_blocklist(container_client, blob_name: str, text_to_append: str):
+    """
+    Bezpečný append pro text: stáhne jen seznam commited block IDs, přidá nový block a commitne.
+    Funguje na BlockBlob (nenutí AppendBlob).
+    """
+    from azure.storage.blob import BlobBlock
     from azure.core.exceptions import ResourceNotFoundError
+    import base64, secrets
+
     bc = container_client.get_blob_client(blob_name)
+
+    # pokud blob neexistuje, vytvoř prázdný
     try:
         bc.get_blob_properties()
     except ResourceNotFoundError:
-        bc.create_append_blob()
-        if header:
-            bc.append_block(header.encode("utf-8"))
-    return bc
+        bc.upload_blob(b"", overwrite=True)
 
-def _append_line_append_blob(container_client, blob_name: str, line: str, header: str = ""):
-    bc = _ensure_append_blob_with_header(container_client, blob_name, header)
-    bc.append_block(line.encode("utf-8"))
+    # získej existující block list
+    bl = bc.get_block_list(block_list_type="committed")
+    committed = []
+    if hasattr(bl, "committed_blocks") and bl.committed_blocks:
+        committed = [b.id for b in bl.committed_blocks if getattr(b, "id", None)]
+    elif isinstance(bl, list):
+        committed = [getattr(b, "id", None) for b in bl if getattr(b, "id", None)]
 
-# ====================== API call CSV logging (AppendBlob) ======================
+    # nový block
+    block_id = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
+    bc.stage_block(block_id=block_id, data=text_to_append.encode("utf-8"))
+
+    # commit combined
+    new_list = [BlobBlock(bid) for bid in committed] + [BlobBlock(block_id)]
+    bc.commit_block_list(new_list)
+
+def _append_trade_line(logs_cc, blob_name: str, line: str):
+    # pokud blob neexistuje, připrav hlavičku
+    from azure.core.exceptions import ResourceNotFoundError
+    bc = logs_cc.get_blob_client(blob_name)
+    header = "time_utc,pair,model,side,executedQty,avgFillPrice,cummulativeQuoteQty,fee_total,fee_asset,orderId,b_level,s_level,b_signal_date\n"
+    try:
+        bc.get_blob_properties()
+    except ResourceNotFoundError:
+        bc.upload_blob(header.encode("utf-8"), overwrite=True)
+    _append_text_blob_blocklist(logs_cc, blob_name, line)
+
+# ====================== API call CSV logging ======================
 
 def _api_csv_blob_name() -> str:
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     return f"api_calls_{today}.csv"
+
+def _ensure_api_csv_header(logs_cc):
+    from azure.core.exceptions import ResourceNotFoundError
+    bc = logs_cc.get_blob_client(_api_csv_blob_name())
+    try:
+        bc.get_blob_properties()
+    except ResourceNotFoundError:
+        header = "ts,method,path,params,status,error,resp_sample\n"
+        bc.upload_blob(header.encode("utf-8"), overwrite=True)
 
 def _sanitize_params(p: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(p, dict):
@@ -131,6 +168,8 @@ def _sanitize_params(p: Dict[str, Any]) -> Dict[str, Any]:
 def _append_api_csv(logs_cc, *, method: str, path: str, params: Dict[str, Any], status: Any, error: Optional[str], resp_text: Optional[str]):
     if not API_CSV_LOGGING:
         return
+    _ensure_api_csv_header(logs_cc)
+    # omez výstup
     params_ser = json.dumps(_sanitize_params(params or {}), ensure_ascii=False, separators=(",", ":"))
     resp_sample = (resp_text or "")
     if isinstance(resp_sample, str) and len(resp_sample) > 1000:
@@ -144,8 +183,7 @@ def _append_api_csv(logs_cc, *, method: str, path: str, params: Dict[str, Any], 
         (error or "").replace("\n"," ").replace("\r"," "),
         resp_sample.replace("\n"," ").replace("\r"," ")
     ]) + "\n"
-    header = "ts,method,path,params,status,error,resp_sample\n"
-    _append_line_append_blob(logs_cc, _api_csv_blob_name(), line, header=header)
+    _append_text_blob_blocklist(logs_cc, _api_csv_blob_name(), line)
 
 # ====================== Master CSV loader (1× za tik) ======================
 
@@ -407,11 +445,6 @@ def _sum_fee(fills: List[Dict[str,Any]]) -> Tuple[float,str]:
 def _timestamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-def _ensure_trade_log_header_and_append(logs_cc, pair: str, line: str):
-    blob_name = _trade_log_blob_name(pair)
-    header = "time_utc,pair,model,side,executedQty,avgFillPrice,cummulativeQuoteQty,fee_total,fee_asset,orderId,b_level,s_level,b_signal_date\n"
-    _append_line_append_blob(logs_cc, blob_name, line, header=header)
-
 def _fetch_prices_parallel(session: requests.Session, logs_cc, pairs: List[str]) -> Dict[str, float]:
     """
     Stáhne /ticker/price pro všechny páry paralelně, vrátí mapu {pair: price}.
@@ -505,7 +538,7 @@ def run_decision_for_pair(session: requests.Session,
             f"{st.get('s_level',0.0):.8f}",
             str(st.get("signal_date") or "")
         ]) + "\n"
-        _ensure_trade_log_header_and_append(logs_cc, pair, line)
+        _append_trade_line(logs_cc, _trade_log_blob_name(pair), line)
 
         st = { "position":"flat", "qty":0.0, "entry_price":None, "entry_quote":0.0,
                "b_level":None, "s_level":None, "signal_date":None }
@@ -543,7 +576,7 @@ def run_decision_for_pair(session: requests.Session,
             f"{S:.8f}",
             str(sig_row.get("date") or "")
         ]) + "\n"
-        _ensure_trade_log_header_and_append(logs_cc, pair, line)
+        _append_trade_line(logs_cc, _trade_log_blob_name(pair), line)
 
         st = {
             "position": "long",
@@ -566,7 +599,7 @@ def main(mytimer: func.TimerRequest) -> None:
     try:
         _, models_cc, state_cc, logs_cc = _make_blob_clients()
 
-        # 0) páry/modely
+        # 0) Parsuj páry/modely + výpis pro diagnózu
         pairs_models = _parse_pairs_models(TRADE_PAIRS_MODELS)
         if not pairs_models:
             logger.error("TRADE_PAIRS_MODELS is empty"); return
@@ -585,7 +618,7 @@ def main(mytimer: func.TimerRequest) -> None:
         # 4) ceny paralelně
         prices = _fetch_prices_parallel(session, logs_cc, pairs)
 
-        # 5) rozhodnutí per pair-model
+        # 5) rozhodnutí per pair-model (sekvenčně; ordery řešíme jednotlivě)
         start = time.time()
         for pair, model in pairs_models:
             sig_row = sig_map.get((pair, model))
