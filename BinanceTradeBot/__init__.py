@@ -98,6 +98,66 @@ def _append_trade_line(logs_cc, blob_name: str, line: str):
         old = "time_utc,pair,model,side,executedQty,avgFillPrice,cummulativeQuoteQty,fee_total,fee_asset,orderId,b_level,s_level,b_signal_date\n"
     bc.upload_blob((old + line), overwrite=True)
 
+# ---------------------- API call CSV logging ----------------------
+
+def _api_csv_blob_name() -> str:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return f"api_calls_{today}.csv"
+
+def _append_api_csv(logs_cc, row: Dict[str, Any]):
+    """
+    Zapíše jeden řádek do denního CSV s API voláními.
+    Sloupce: ts,method,path,params,status,error,resp_sample
+    """
+    from azure.core.exceptions import ResourceNotFoundError
+    bc = logs_cc.get_blob_client(_api_csv_blob_name())
+    header = "ts,method,path,params,status,error,resp_sample\n"
+    try:
+        old = bc.download_blob().readall().decode("utf-8")
+        if not old.startswith("ts,"):
+            old = header
+    except ResourceNotFoundError:
+        old = header
+    # serializace hodnot (params jako JSON bez citlivých klíčů)
+    params_ser = json.dumps(row.get("params", {}), ensure_ascii=False, separators=(",", ":"))
+    resp_sample = row.get("resp_sample", "")
+    # omez výstup
+    if isinstance(resp_sample, str) and len(resp_sample) > 1000:
+        resp_sample = resp_sample[:1000] + "..."
+    line = ",".join([
+        row.get("ts",""),
+        row.get("method",""),
+        row.get("path",""),
+        params_ser.replace("\n"," ").replace("\r"," "),
+        str(row.get("status","")),
+        (row.get("error","") or "").replace("\n"," ").replace("\r"," "),
+        (resp_sample or "").replace("\n"," ").replace("\r"," ")
+    ]) + "\n"
+    bc.upload_blob(old + line, overwrite=True)
+
+def _sanitize_params(p: Dict[str, Any]) -> Dict[str, Any]:
+    # odstraň citlivé/směšně dlouhé věci
+    if not isinstance(p, dict):
+        return {}
+    cleaned = dict(p)
+    cleaned.pop("signature", None)
+    return cleaned
+
+def _log_api_call_csv(logs_cc, *, method: str, path: str, params: Dict[str, Any], status: int, error: Optional[str], resp_text: Optional[str]):
+    try:
+        _append_api_csv(logs_cc, {
+            "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "method": method,
+            "path": path,
+            "params": _sanitize_params(params or {}),
+            "status": status,
+            "error": error or "",
+            "resp_sample": resp_text or ""
+        })
+    except Exception:
+        # Logging CSV selhat nesmí zlomit trading
+        logger.warning("[api-csv] failed to append log", exc_info=True)
+
 # ---------------------- Master CSV loader ----------------------
 
 def _load_active_signal_for(models_cc, pair: str, model: str) -> Optional[Dict[str, Any]]:
@@ -121,13 +181,11 @@ def _load_active_signal_for(models_cc, pair: str, model: str) -> Optional[Dict[s
         logger.error("Master CSV missing columns, have: %s", df.columns.tolist())
         return None
 
-    # zjisti název sloupce s počtem cyklů
     cycles_col = "cycles" if "cycles" in df.columns else ("total_cycles" if "total_cycles" in df.columns else None)
     if cycles_col is None:
         logger.error("Master CSV must contain 'cycles' or 'total_cycles'. Columns: %s", df.columns.tolist())
         return None
 
-    # normalizace a filtry
     df["pair"] = df["pair"].astype(str).str.upper()
     df["model"] = df["model"].astype(str)
     df = df[(df["pair"]==pair.upper()) & (df["model"]==model)]
@@ -159,7 +217,7 @@ def _load_active_signal_for(models_cc, pair: str, model: str) -> Optional[Dict[s
         logger.exception("Failed to parse master row for %s/%s", pair, model)
         return None
 
-# ---------------------- Binance REST helpers ----------------------
+# ---------------------- Binance REST helpers (s CSV logging) ----------------------
 
 def _sign(query: str) -> str:
     return hmac.new(BINANCE_API_SECRET.encode("utf-8"), query.encode("utf-8"), hashlib.sha256).hexdigest()
@@ -170,25 +228,56 @@ def _ts() -> int:
 def _headers() -> Dict[str,str]:
     return {"X-MBX-APIKEY": BINANCE_API_KEY}
 
-def api_get(path: str, params: Dict[str, Any]) -> Any:
+def api_get(path: str, params: Dict[str, Any], *, logs_cc=None) -> Any:
     url = f"{BASE_URL}{path}"
-    r = requests.get(url, params=params, headers=_headers(), timeout=TIMEOUT_S)
-    r.raise_for_status()
-    return r.json()
+    try:
+        r = requests.get(url, params=params, headers=_headers(), timeout=TIMEOUT_S)
+        status = r.status_code
+        text_sample = r.text[:800] if isinstance(r.text, str) else ""
+        r.raise_for_status()
+        j = r.json()
+        if logs_cc: _log_api_call_csv(logs_cc, method="GET", path=path, params=params, status=status, error=None, resp_text=text_sample)
+        return j
+    except Exception as e:
+        if logs_cc:
+            # pokud máme response, pokusíme se zalogovat status/text
+            status = getattr(e.response, "status_code", "") if hasattr(e, "response") else ""
+            text = ""
+            try:
+                text = e.response.text[:800] if getattr(e, "response", None) is not None else ""
+            except Exception:
+                text = ""
+            _log_api_call_csv(logs_cc, method="GET", path=path, params=params, status=status, error=str(e), resp_text=text)
+        raise
 
-def api_signed_post(path: str, params: Dict[str, Any]) -> Any:
+def api_signed_post(path: str, params: Dict[str, Any], *, logs_cc=None) -> Any:
     p = dict(params)
     p["timestamp"] = _ts()
     p["recvWindow"] = RECV_WINDOW
     qs = urllib.parse.urlencode(p, doseq=True)
     sig = _sign(qs)
     url = f"{BASE_URL}{path}?{qs}&signature={sig}"
-    r = requests.post(url, headers=_headers(), timeout=TIMEOUT_S)
-    r.raise_for_status()
-    return r.json()
+    try:
+        r = requests.post(url, headers=_headers(), timeout=TIMEOUT_S)
+        status = r.status_code
+        text_sample = r.text[:800] if isinstance(r.text, str) else ""
+        r.raise_for_status()
+        j = r.json()
+        if logs_cc: _log_api_call_csv(logs_cc, method="POST", path=path, params=_sanitize_params(p), status=status, error=None, resp_text=text_sample)
+        return j
+    except Exception as e:
+        if logs_cc:
+            status = getattr(e.response, "status_code", "") if hasattr(e, "response") else ""
+            text = ""
+            try:
+                text = e.response.text[:800] if getattr(e, "response", None) is not None else ""
+            except Exception:
+                text = ""
+            _log_api_call_csv(logs_cc, method="POST", path=path, params=_sanitize_params(p), status=status, error=str(e), resp_text=text)
+        raise
 
-def get_price(symbol: str) -> float:
-    j = api_get("/api/v3/ticker/price", {"symbol": symbol})
+def get_price(symbol: str, *, logs_cc=None) -> float:
+    j = api_get("/api/v3/ticker/price", {"symbol": symbol}, logs_cc=logs_cc)
     return float(j["price"])
 
 # ---------------------- exchangeInfo cache (1× denně) ----------------------
@@ -197,11 +286,10 @@ def _pairs_from_env(val: str) -> List[str]:
     out = []
     for piece in val.split(","):
         piece = piece.strip()
-        if not piece or ":" not in piece: 
+        if not piece or ":" not in piece:
             continue
         pair, _model = piece.split(":",1)
         out.append(pair.strip().upper())
-    # dedup
     seen = set(); res = []
     for p in out:
         if p not in seen:
@@ -221,12 +309,11 @@ def _ensure_exchangeinfo_json_for_today(logs_cc, pairs: List[str]) -> Dict[str, 
     blob_name = _exchangeinfo_blob_name_for_today()
     cached = _read_blob_json(logs_cc, blob_name)
     if cached and isinstance(cached, dict) and cached.get("asof_date"):
+        logger.info("[exchangeInfo] using cached %s", blob_name)
         return cached
 
-    # --- Stáhni 1× exchangeInfo pro všechny páry ---
-    # Endpoint podporuje parametr 'symbols' jako JSON pole (URL-encoded).
     symbols_param = json.dumps(pairs, separators=(",", ":"))
-    info = api_get("/api/v3/exchangeInfo", {"symbols": symbols_param})
+    info = api_get("/api/v3/exchangeInfo", {"symbols": symbols_param}, logs_cc=logs_cc)
 
     filt_map: Dict[str, Any] = {}
     for sym in info.get("symbols", []):
@@ -238,20 +325,14 @@ def _ensure_exchangeinfo_json_for_today(logs_cc, pairs: List[str]) -> Dict[str, 
         for f in sym.get("filters", []):
             ftype = f.get("filterType")
             if ftype == "PRICE_FILTER":
-                try:
-                    tick_size = float(f.get("tickSize"))
-                except Exception:
-                    tick_size = None
+                try: tick_size = float(f.get("tickSize"))
+                except: tick_size = None
             elif ftype == "LOT_SIZE":
-                try:
-                    step_size = float(f.get("stepSize"))
-                except Exception:
-                    step_size = None
+                try: step_size = float(f.get("stepSize"))
+                except: step_size = None
             elif ftype == "MIN_NOTIONAL":
-                try:
-                    min_notional = float(f.get("minNotional", "0") or 0)
-                except Exception:
-                    min_notional = None
+                try: min_notional = float(f.get("minNotional", "0") or 0)
+                except: min_notional = None
         if sname:
             filt_map[sname.upper()] = {
                 "status": status,
@@ -289,7 +370,7 @@ def round_down_qty(qty: float, step: float) -> float:
 
 # ---------------------- Orders ----------------------
 
-def place_market_buy_quote(symbol: str, quote_usdt: float) -> Dict[str, Any]:
+def place_market_buy_quote(symbol: str, quote_usdt: float, *, logs_cc=None) -> Dict[str, Any]:
     """
     MARKET BUY s přesnou útratou v USDT: quoteOrderQty.
     Vrací JSON orderu (obsahuje cummulativeQuoteQty, executedQty, fills[]).
@@ -301,9 +382,9 @@ def place_market_buy_quote(symbol: str, quote_usdt: float) -> Dict[str, Any]:
         "quoteOrderQty": f"{quote_usdt:.8f}",
         "newOrderRespType": "FULL"
     }
-    return api_signed_post("/api/v3/order", params)
+    return api_signed_post("/api/v3/order", params, logs_cc=logs_cc)
 
-def place_market_sell_qty(symbol: str, qty: float) -> Dict[str, Any]:
+def place_market_sell_qty(symbol: str, qty: float, *, logs_cc=None) -> Dict[str, Any]:
     params = {
         "symbol": symbol,
         "side": "SELL",
@@ -311,7 +392,7 @@ def place_market_sell_qty(symbol: str, qty: float) -> Dict[str, Any]:
         "quantity": f"{qty:.8f}",
         "newOrderRespType": "FULL"
     }
-    return api_signed_post("/api/v3/order", params)
+    return api_signed_post("/api/v3/order", params, logs_cc=logs_cc)
 
 # ---------------------- Bot logic ----------------------
 
@@ -373,7 +454,7 @@ def run_tick_for_pair(models_cc, state_cc, logs_cc, pair: str, model: str, exch_
 
     # 3) aktuální cena
     try:
-        px = get_price(pair)
+        px = get_price(pair, logs_cc=logs_cc)
     except Exception as e:
         logger.warning("[%s] price failed: %s", pair, e)
         return
@@ -399,7 +480,7 @@ def run_tick_for_pair(models_cc, state_cc, logs_cc, pair: str, model: str, exch_
             return
 
         try:
-            odr = place_market_sell_qty(pair, qty_sell)
+            odr = place_market_sell_qty(pair, qty_sell, logs_cc=logs_cc)
         except Exception as e:
             logger.warning("[%s/%s] SELL order failed: %s", pair, model, e)
             return
@@ -437,7 +518,7 @@ def run_tick_for_pair(models_cc, state_cc, logs_cc, pair: str, model: str, exch_
                         pair, model, ORDER_USDT, min_notional)
             return
         try:
-            odr = place_market_buy_quote(pair, ORDER_USDT)
+            odr = place_market_buy_quote(pair, ORDER_USDT, logs_cc=logs_cc)
         except Exception as e:
             logger.warning("[%s/%s] BUY order failed: %s", pair, model, e)
             return
