@@ -10,8 +10,8 @@ import urllib.parse
 from datetime import datetime, timezone
 from typing import Dict, Any, Tuple, Optional, List
 
-
 import azure.functions as func
+import requests
 
 # ---------------------- ENV ----------------------
 
@@ -37,13 +37,13 @@ STATE_CONTAINER        = _get_env("STATE_CONTAINER", "bot-state")
 TRADE_LOGS_CONTAINER   = _get_env("TRADE_LOGS_CONTAINER", "trade-logs")
 
 # Trading – výběr signálů
-TRADE_PAIRS_MODELS     = _get_env("TRADE_PAIRS_MODELS", "XRPUSDT:BS_MedianScore")  # "AAVEUSDT:BS_MedianScore, BTCUSDT:BS_MedianScore"
+TRADE_PAIRS_MODELS     = _get_env("TRADE_PAIRS_MODELS", "XRPUSDT:BS_MedianScore")
 MIN_CYCLES_PER_DAY     = _get_int("MIN_CYCLES_PER_DAY", 1)
 MIN_SCORE              = _get_float("MIN_SCORE", 0.0)
 
 # Objednávky
-ORDER_USDT             = _get_float("ORDER_USDT", 10.0)   # kolik USDT utratit při BUY (quoteOrderQty)
-TAKER_FEE_PCT          = _get_float("COSTS_PCT", 0.001)   # jen pro info/log (Binance poplatek přijde z fills)
+ORDER_USDT             = _get_float("ORDER_USDT", 10.0)   # Market BUY utratí přesně tuto částku (quoteOrderQty)
+TAKER_FEE_PCT          = _get_float("COSTS_PCT", 0.001)   # pouze informativně do logu
 
 # Binance API
 BINANCE_API_KEY        = _get_env("BINANCE_API_KEY", required=True)
@@ -52,7 +52,6 @@ USE_TESTNET            = (_get_env("BINANCE_TESTNET", "true").lower() in ("1","t
 RECV_WINDOW            = _get_int("BINANCE_RECV_WINDOW", 5000)
 TIMEOUT_S              = _get_int("BINANCE_HTTP_TIMEOUT", 15)
 
-# Endpoints
 BASE_URL = "https://testnet.binance.vision" if USE_TESTNET else "https://api.binance.com"
 
 logger = logging.getLogger("BinanceTradeBot")
@@ -91,7 +90,6 @@ def _write_blob_json(cc, name: str, obj: Dict[str, Any]) -> None:
     )
 
 def _append_trade_line(logs_cc, blob_name: str, line: str):
-    # jednoduchý “append by overwrite”: stáhni, přidej, nahraj
     from azure.core.exceptions import ResourceNotFoundError
     bc = logs_cc.get_blob_client(blob_name)
     try:
@@ -104,8 +102,8 @@ def _append_trade_line(logs_cc, blob_name: str, line: str):
 
 def _load_active_signal_for(models_cc, pair: str, model: str) -> Optional[Dict[str, Any]]:
     """
-    Z master CSV (MODELS_CONTAINER/MASTER_CSV_NAME) vybere poslední řádek pro pair+model
-    s is_active=True a splněnými prahy (min cycles/score). Vrátí dict s B,S,date,...
+    Z master CSV vybere poslední řádek pro pair+model s is_active=True
+    a prahy (min cycles/score). Akceptuje jak 'cycles', tak 'total_cycles'.
     """
     import pandas as pd
     from azure.core.exceptions import ResourceNotFoundError
@@ -118,22 +116,34 @@ def _load_active_signal_for(models_cc, pair: str, model: str) -> Optional[Dict[s
         return None
 
     df = pd.read_csv(io.BytesIO(raw))
-    need = {"pair","model","B","S","date","load_time_utc","is_active","cycles","score"}
-    if not need.issubset(df.columns):
-        logger.error("Master CSV missing columns, have: %s", df.columns.tolist()); return None
+    required = {"pair","model","B","S","date","load_time_utc","is_active","score"}
+    if not required.issubset(df.columns):
+        logger.error("Master CSV missing columns, have: %s", df.columns.tolist())
+        return None
 
+    # zjisti název sloupce s počtem cyklů
+    cycles_col = None
+    if "cycles" in df.columns:
+        cycles_col = "cycles"
+    elif "total_cycles" in df.columns:
+        cycles_col = "total_cycles"
+    else:
+        logger.error("Master CSV must contain 'cycles' or 'total_cycles'. Columns: %s", df.columns.tolist())
+        return None
+
+    # normalizace a filtry
     df["pair"] = df["pair"].astype(str).str.upper()
     df["model"] = df["model"].astype(str)
     df = df[(df["pair"]==pair.upper()) & (df["model"]==model)]
-    if df.empty: return None
+    if df.empty:
+        return None
 
-    # filtry
     df = df[(df["is_active"]==True) &
-            (df["cycles"] >= MIN_CYCLES_PER_DAY) &
+            (df[cycles_col] >= MIN_CYCLES_PER_DAY) &
             (df["score"]  >= MIN_SCORE)].copy()
-    if df.empty: return None
+    if df.empty:
+        return None
 
-    import pandas as pd
     df["load_time_utc"] = pd.to_datetime(df["load_time_utc"], errors="coerce", utc=True)
     df = df.sort_values(["date","load_time_utc"])
     r = df.iloc[-1]
@@ -146,7 +156,7 @@ def _load_active_signal_for(models_cc, pair: str, model: str) -> Optional[Dict[s
             "S": float(r["S"]),
             "date": str(r["date"]),
             "load_time_utc": (r["load_time_utc"].strftime("%Y-%m-%dT%H:%M:%SZ") if not pd.isna(r["load_time_utc"]) else None),
-            "cycles": float(r["cycles"]),
+            "cycles": float(r[cycles_col]),
             "score": float(r["score"])
         }
     except Exception:
@@ -154,8 +164,6 @@ def _load_active_signal_for(models_cc, pair: str, model: str) -> Optional[Dict[s
         return None
 
 # ---------------------- Binance REST helpers ----------------------
-
-import requests
 
 def _sign(query: str) -> str:
     return hmac.new(BINANCE_API_SECRET.encode("utf-8"), query.encode("utf-8"), hashlib.sha256).hexdigest()
@@ -172,17 +180,6 @@ def api_get(path: str, params: Dict[str, Any]) -> Any:
     r.raise_for_status()
     return r.json()
 
-def api_signed_get(path: str, params: Dict[str, Any]) -> Any:
-    p = dict(params)
-    p["timestamp"] = _ts()
-    p["recvWindow"] = RECV_WINDOW
-    qs = urllib.parse.urlencode(p, doseq=True)
-    sig = _sign(qs)
-    url = f"{BASE_URL}{path}?{qs}&signature={sig}"
-    r = requests.get(url, headers=_headers(), timeout=TIMEOUT_S)
-    r.raise_for_status()
-    return r.json()
-
 def api_signed_post(path: str, params: Dict[str, Any]) -> Any:
     p = dict(params)
     p["timestamp"] = _ts()
@@ -195,8 +192,7 @@ def api_signed_post(path: str, params: Dict[str, Any]) -> Any:
     return r.json()
 
 def get_exchange_info(symbol: str) -> Dict[str, Any]:
-    j = api_get("/api/v3/exchangeInfo", {"symbol": symbol})
-    return j
+    return api_get("/api/v3/exchangeInfo", {"symbol": symbol})
 
 def get_symbol_filters(symbol: str) -> Tuple[float, float]:
     """
@@ -221,12 +217,10 @@ def get_price(symbol: str) -> float:
     j = api_get("/api/v3/ticker/price", {"symbol": symbol})
     return float(j["price"])
 
-# -------- orders: MARKET BUY (quoteOrderQty) & MARKET SELL (quantity) --------
-
 def place_market_buy_quote(symbol: str, quote_usdt: float) -> Dict[str, Any]:
     """
     MARKET BUY s přesnou útratou v USDT: quoteOrderQty.
-    Vrací JSON orderu (obsahuje cummulativeQuoteQty, executedQty, fills[] s price+commission).
+    Vrací JSON orderu (obsahuje cummulativeQuoteQty, executedQty, fills[]).
     """
     params = {
         "symbol": symbol,
@@ -262,7 +256,6 @@ def _state_blob_name(pair: str, model: str) -> str:
     return f"{pair}_{model}.json"
 
 def _trade_log_blob_name(pair: str) -> str:
-    # jeden soubor na pár, ať je to přehledné
     return f"{pair}.csv"
 
 def _avg_fill_price(fills: List[Dict[str,Any]]) -> float:
@@ -287,15 +280,6 @@ def _timestamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def run_tick_for_pair(models_cc, state_cc, logs_cc, pair: str, model: str):
-    """
-    Jeden minutový tik:
-      - zjisti aktivní signal (B,S) z masteru podle filtrů
-      - načti/ulož state (flat/long, qty, entry)
-      - rozhodni BUY/SELL
-      - BUY -> quoteOrderQty=ORDER_USDT
-      - SELL -> quantity dle stavu (stepSize)
-      - zapiš trade do trade-logs/{pair}.csv
-    """
     # 1) Signál
     sig = _load_active_signal_for(models_cc, pair, model)
     if not sig:
@@ -303,13 +287,14 @@ def run_tick_for_pair(models_cc, state_cc, logs_cc, pair: str, model: str):
         return
 
     B = float(sig["B"]); S = float(sig["S"])
+
     # 2) Stav
     s_name = _state_blob_name(pair, model)
     st = _read_blob_json(state_cc, s_name) or {
         "position": "flat",
         "qty": 0.0,
-        "entry_price": None,             # průměrná fill cena
-        "entry_quote": 0.0,              # utracené USDT na BUY (cummulativeQuoteQty)
+        "entry_price": None,
+        "entry_quote": 0.0,
         "b_level": None, "s_level": None,
         "signal_date": None
     }
@@ -332,13 +317,11 @@ def run_tick_for_pair(models_cc, state_cc, logs_cc, pair: str, model: str):
     if st["position"] == "long" and px >= (st.get("s_level") or S):
         qty_sell = round_down_qty(float(st["qty"]), step)
         if qty_sell <= 0:
-            # nic k prodeji → srovnat state
             st = { "position":"flat", "qty":0.0, "entry_price":None, "entry_quote":0.0,
                    "b_level":None, "s_level":None, "signal_date":None }
             _write_blob_json(state_cc, s_name, st)
             return
 
-        # minNotional check (pouze info – Binance případně odmítne)
         if min_notional and qty_sell * px < min_notional:
             logger.info("[%s/%s] SELL under minNotional (qty=%s px=%s) → skip.",
                         pair, model, qty_sell, px)
@@ -350,7 +333,6 @@ def run_tick_for_pair(models_cc, state_cc, logs_cc, pair: str, model: str):
             logger.warning("[%s/%s] SELL order failed: %s", pair, model, e)
             return
 
-        # Log SELL
         executed_qty = float(odr.get("executedQty", "0"))
         cq = float(odr.get("cummulativeQuoteQty", "0"))
         fills = odr.get("fills", []) or []
@@ -371,7 +353,6 @@ def run_tick_for_pair(models_cc, state_cc, logs_cc, pair: str, model: str):
         ]) + "\n"
         _append_trade_line(logs_cc, _trade_log_blob_name(pair), line)
 
-        # reset state
         st = { "position":"flat", "qty":0.0, "entry_price":None, "entry_quote":0.0,
                "b_level":None, "s_level":None, "signal_date":None }
         _write_blob_json(state_cc, s_name, st)
@@ -380,8 +361,6 @@ def run_tick_for_pair(models_cc, state_cc, logs_cc, pair: str, model: str):
 
     # 6) BUY podmínka
     if st["position"] == "flat" and px <= B:
-        # BUY for exact USDT using quoteOrderQty
-        # kontrola minNotional (ORDER_USDT by měl být >= minNotional)
         if min_notional and ORDER_USDT < min_notional:
             logger.info("[%s/%s] BUY under minNotional (%.4f < %.4f) → skip",
                         pair, model, ORDER_USDT, min_notional)
@@ -393,12 +372,11 @@ def run_tick_for_pair(models_cc, state_cc, logs_cc, pair: str, model: str):
             return
 
         executed_qty = float(odr.get("executedQty","0"))
-        cq = float(odr.get("cummulativeQuoteQty","0"))  # reálně utracené USDT
+        cq = float(odr.get("cummulativeQuoteQty","0"))
         fills = odr.get("fills", []) or []
         avgp = _avg_fill_price(fills)
         fee_total, fee_asset = _sum_fee(fills)
 
-        # Log BUY – zapisujeme skutečné fill údaje
         line = ",".join([
             _timestamp(), pair, model, "BUY",
             f"{executed_qty:.8f}",
@@ -413,7 +391,6 @@ def run_tick_for_pair(models_cc, state_cc, logs_cc, pair: str, model: str):
         ]) + "\n"
         _append_trade_line(logs_cc, _trade_log_blob_name(pair), line)
 
-        # update state (carry přes půlnoc – S zůstává ze dne vstupu)
         st = {
             "position": "long",
             "qty": executed_qty,
