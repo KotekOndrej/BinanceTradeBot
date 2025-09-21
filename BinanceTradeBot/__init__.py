@@ -122,12 +122,8 @@ def _load_active_signal_for(models_cc, pair: str, model: str) -> Optional[Dict[s
         return None
 
     # zjisti název sloupce s počtem cyklů
-    cycles_col = None
-    if "cycles" in df.columns:
-        cycles_col = "cycles"
-    elif "total_cycles" in df.columns:
-        cycles_col = "total_cycles"
-    else:
+    cycles_col = "cycles" if "cycles" in df.columns else ("total_cycles" if "total_cycles" in df.columns else None)
+    if cycles_col is None:
         logger.error("Master CSV must contain 'cycles' or 'total_cycles'. Columns: %s", df.columns.tolist())
         return None
 
@@ -191,31 +187,107 @@ def api_signed_post(path: str, params: Dict[str, Any]) -> Any:
     r.raise_for_status()
     return r.json()
 
-def get_exchange_info(symbol: str) -> Dict[str, Any]:
-    return api_get("/api/v3/exchangeInfo", {"symbol": symbol})
+def get_price(symbol: str) -> float:
+    j = api_get("/api/v3/ticker/price", {"symbol": symbol})
+    return float(j["price"])
 
-def get_symbol_filters(symbol: str) -> Tuple[float, float]:
+# ---------------------- exchangeInfo cache (1× denně) ----------------------
+
+def _pairs_from_env(val: str) -> List[str]:
+    out = []
+    for piece in val.split(","):
+        piece = piece.strip()
+        if not piece or ":" not in piece: 
+            continue
+        pair, _model = piece.split(":",1)
+        out.append(pair.strip().upper())
+    # dedup
+    seen = set(); res = []
+    for p in out:
+        if p not in seen:
+            seen.add(p); res.append(p)
+    return res
+
+def _exchangeinfo_blob_name_for_today() -> str:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return f"exchangeinfo_{today}.json"
+
+def _ensure_exchangeinfo_json_for_today(logs_cc, pairs: List[str]) -> Dict[str, Any]:
     """
-    Vrátí (stepSize, minNotional) pro symbol.
+    Zkus načíst dnešní exchangeinfo JSON z TRADE_LOGS_CONTAINER.
+    Pokud neexistuje, zavolá 1× Binance /api/v3/exchangeInfo se seznamem symbolů,
+    uloží minimalizovaný JSON a vrátí mapu filtrů.
     """
-    info = get_exchange_info(symbol)
-    sym = info["symbols"][0]
-    step = 0.0
-    min_notional = 0.0
-    for f in sym["filters"]:
-        if f["filterType"] == "LOT_SIZE":
-            step = float(f["stepSize"])
-        if f["filterType"] == "MIN_NOTIONAL":
-            min_notional = float(f.get("minNotional", "0") or 0)
-    return (step or 0.0), (min_notional or 0.0)
+    blob_name = _exchangeinfo_blob_name_for_today()
+    cached = _read_blob_json(logs_cc, blob_name)
+    if cached and isinstance(cached, dict) and cached.get("asof_date"):
+        return cached
+
+    # --- Stáhni 1× exchangeInfo pro všechny páry ---
+    # Endpoint podporuje parametr 'symbols' jako JSON pole (URL-encoded).
+    symbols_param = json.dumps(pairs, separators=(",", ":"))
+    info = api_get("/api/v3/exchangeInfo", {"symbols": symbols_param})
+
+    filt_map: Dict[str, Any] = {}
+    for sym in info.get("symbols", []):
+        sname = sym.get("symbol")
+        status = sym.get("status")
+        tick_size = None
+        step_size = None
+        min_notional = None
+        for f in sym.get("filters", []):
+            ftype = f.get("filterType")
+            if ftype == "PRICE_FILTER":
+                try:
+                    tick_size = float(f.get("tickSize"))
+                except Exception:
+                    tick_size = None
+            elif ftype == "LOT_SIZE":
+                try:
+                    step_size = float(f.get("stepSize"))
+                except Exception:
+                    step_size = None
+            elif ftype == "MIN_NOTIONAL":
+                try:
+                    min_notional = float(f.get("minNotional", "0") or 0)
+                except Exception:
+                    min_notional = None
+        if sname:
+            filt_map[sname.upper()] = {
+                "status": status,
+                "tickSize": tick_size or 0.0,
+                "stepSize": step_size or 0.0,
+                "minNotional": min_notional or 0.0
+            }
+
+    payload = {
+        "asof_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "filters": filt_map
+    }
+    _write_blob_json(logs_cc, blob_name, payload)
+    logger.info("[exchangeInfo] cached to %s (%d symbols)", blob_name, len(filt_map))
+    return payload
+
+def get_symbol_filters_cached(filters_json: Dict[str, Any], symbol: str) -> Tuple[float, float, float, str]:
+    """
+    Vrátí (stepSize, minNotional, tickSize, status) z denního JSONu.
+    Pokud symbol nenajdeme, vrací (0,0,0,"UNKNOWN").
+    """
+    entry = (filters_json.get("filters") or {}).get(symbol.upper())
+    if not entry:
+        return (0.0, 0.0, 0.0, "UNKNOWN")
+    return (
+        float(entry.get("stepSize", 0.0)),
+        float(entry.get("minNotional", 0.0)),
+        float(entry.get("tickSize", 0.0)),
+        str(entry.get("status", "TRADING") or "TRADING")
+    )
 
 def round_down_qty(qty: float, step: float) -> float:
     if step <= 0: return qty
     return math.floor(qty / step) * step
 
-def get_price(symbol: str) -> float:
-    j = api_get("/api/v3/ticker/price", {"symbol": symbol})
-    return float(j["price"])
+# ---------------------- Orders ----------------------
 
 def place_market_buy_quote(symbol: str, quote_usdt: float) -> Dict[str, Any]:
     """
@@ -279,7 +351,7 @@ def _sum_fee(fills: List[Dict[str,Any]]) -> Tuple[float,str]:
 def _timestamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-def run_tick_for_pair(models_cc, state_cc, logs_cc, pair: str, model: str):
+def run_tick_for_pair(models_cc, state_cc, logs_cc, pair: str, model: str, exch_cache: Dict[str,Any]):
     # 1) Signál
     sig = _load_active_signal_for(models_cc, pair, model)
     if not sig:
@@ -306,12 +378,11 @@ def run_tick_for_pair(models_cc, state_cc, logs_cc, pair: str, model: str):
         logger.warning("[%s] price failed: %s", pair, e)
         return
 
-    # 4) Filtry symbolu
-    try:
-        step, min_notional = get_symbol_filters(pair)
-    except Exception as e:
-        logger.warning("[%s] exchangeInfo failed: %s", pair, e)
-        step, min_notional = (0.0, 0.0)
+    # 4) Filtry symbolu z denního JSONu
+    step, min_notional, tick, status = get_symbol_filters_cached(exch_cache, pair)
+    if status and status != "TRADING":
+        logger.info("[%s/%s] status=%s → skipping trading", pair, model, status)
+        return
 
     # 5) SELL podmínka
     if st["position"] == "long" and px >= (st.get("s_level") or S):
@@ -411,12 +482,17 @@ def run_tick_for_pair(models_cc, state_cc, logs_cc, pair: str, model: str):
 def main(mytimer: func.TimerRequest) -> None:
     try:
         _, models_cc, state_cc, logs_cc = _make_blob_clients()
+
+        # 0) Připrav páry a denní exchangeInfo cache (1× denně JSON v TRADE_LOGS)
         pairs_models = _parse_pairs_models(TRADE_PAIRS_MODELS)
         if not pairs_models:
             logger.error("TRADE_PAIRS_MODELS is empty"); return
+        pairs = sorted({p for (p, _m) in pairs_models})
+        exchangeinfo_today = _ensure_exchangeinfo_json_for_today(logs_cc, pairs)
 
+        # 1) Tik pro každý (pair, model)
         for pair, model in pairs_models:
-            run_tick_for_pair(models_cc, state_cc, logs_cc, pair, model)
+            run_tick_for_pair(models_cc, state_cc, logs_cc, pair, model, exchangeinfo_today)
 
     except Exception:
         logger.exception("[BinanceTradeBot] Unhandled exception in main()")
