@@ -24,46 +24,51 @@ def _get_env(name: str, default: Optional[str] = None, required: bool = False) -
     return v
 
 def _get_float(name: str, default: float) -> float:
-    try: return float(os.getenv(name, str(default)))
-    except: return default
+    try:
+        return float(os.getenv(name, str(default)))
+    except:
+        return default
 
 def _get_int(name: str, default: int) -> int:
-    try: return int(os.getenv(name, str(default)))
-    except: return default
+    try:
+        return int(os.getenv(name, str(default)))
+    except:
+        return default
 
 def _get_bool(name: str, default: bool) -> bool:
     raw = os.getenv(name, "")
-    if raw == "": return default
-    return str(raw).lower() in ("1","true","yes","y","on")
+    if raw == "":
+        return default
+    return str(raw).lower() in ("1", "true", "yes", "y", "on")
 
 # Azure Storage
-WEBJOBS_CONN           = _get_env("AzureWebJobsStorage", required=True)
-MODELS_CONTAINER       = _get_env("MODELS_CONTAINER", "models-recalc")
-MASTER_CSV_NAME        = _get_env("MASTER_CSV_NAME", "bs_levels_master.csv")
-STATE_CONTAINER        = _get_env("STATE_CONTAINER", "bot-state")
-TRADE_LOGS_CONTAINER   = _get_env("TRADE_LOGS_CONTAINER", "trade-logs")
+WEBJOBS_CONN         = _get_env("AzureWebJobsStorage", required=True)
+MODELS_CONTAINER     = _get_env("MODELS_CONTAINER", "models-recalc")
+MASTER_CSV_NAME      = _get_env("MASTER_CSV_NAME", "bs_levels_master.csv")
+STATE_CONTAINER      = _get_env("STATE_CONTAINER", "bot-state")
+TRADE_LOGS_CONTAINER = _get_env("TRADE_LOGS_CONTAINER", "trade-logs")
 
 # Trading – výběr signálů
-TRADE_PAIRS_MODELS     = _get_env("TRADE_PAIRS_MODELS", "XRPUSDT:BS_MedianScore")
-MIN_CYCLES_PER_DAY     = _get_int("MIN_CYCLES_PER_DAY", 1)
-MIN_SCORE              = _get_float("MIN_SCORE", 0.0)
+TRADE_PAIRS_MODELS   = _get_env("TRADE_PAIRS_MODELS", "XRPUSDT:BS_MedianScore")
+MIN_CYCLES_PER_DAY   = _get_int("MIN_CYCLES_PER_DAY", 1)
+MIN_SCORE            = _get_float("MIN_SCORE", 0.0)
 
 # Objednávky
-ORDER_USDT             = _get_float("ORDER_USDT", 10.0)   # Market BUY utratí přesně tuto částku (quoteOrderQty)
+ORDER_USDT           = _get_float("ORDER_USDT", 10.0)  # Market BUY utratí přesně tuto částku (quoteOrderQty)
 
 # Binance API
-BINANCE_API_KEY        = _get_env("BINANCE_API_KEY", required=True)
-BINANCE_API_SECRET     = _get_env("BINANCE_API_SECRET", required=True)
-USE_TESTNET            = (_get_env("BINANCE_TESTNET", "true").lower() in ("1","true","yes"))
-RECV_WINDOW            = _get_int("BINANCE_RECV_WINDOW", 5000)
-TIMEOUT_S              = _get_int("BINANCE_HTTP_TIMEOUT", 15)
+BINANCE_API_KEY      = _get_env("BINANCE_API_KEY", required=True)
+BINANCE_API_SECRET   = _get_env("BINANCE_API_SECRET", required=True)
+USE_TESTNET          = (_get_env("BINANCE_TESTNET", "true").lower() in ("1", "true", "yes"))
+RECV_WINDOW          = _get_int("BINANCE_RECV_WINDOW", 5000)
+TIMEOUT_S            = _get_int("BINANCE_HTTP_TIMEOUT", 15)
 
 # výkon
-PRICE_FETCH_WORKERS    = _get_int("PRICE_FETCH_WORKERS", 10)  # paralelní vlákna pro ticker/price
-API_CSV_LOGGING        = _get_bool("API_CSV_LOGGING", True)   # vypnout na produkci lze nastavením 0/false
+PRICE_FETCH_WORKERS  = _get_int("PRICE_FETCH_WORKERS", 10)   # paralelní vlákna pro ticker/price
+API_CSV_LOGGING      = _get_bool("API_CSV_LOGGING", True)    # vypnout na produkci lze nastavením 0/false
 
 # API log – jeden společný soubor pro všechny běhy
-API_LOG_FILE_NAME      = os.getenv("API_LOG_FILE_NAME", "api_calls.csv")
+API_LOG_FILE_NAME    = os.getenv("API_LOG_FILE_NAME", "api_calls.csv")
 
 BASE_URL = "https://testnet.binance.vision" if USE_TESTNET else "https://api.binance.com"
 
@@ -81,8 +86,10 @@ def _make_blob_clients():
     state_cc  = bs.get_container_client(STATE_CONTAINER)
     logs_cc   = bs.get_container_client(TRADE_LOGS_CONTAINER)
     for cc in (models_cc, state_cc, logs_cc):
-        try: cc.create_container()
-        except ResourceExistsError: pass
+        try:
+            cc.create_container()
+        except ResourceExistsError:
+            pass
     return bs, models_cc, state_cc, logs_cc
 
 def _read_blob_json(cc, name: str) -> Optional[Dict[str, Any]]:
@@ -102,48 +109,79 @@ def _write_blob_json(cc, name: str, obj: Dict[str, Any]) -> None:
         overwrite=True
     )
 
+# --- Helpers pro bezpečný append přes BlockBlob ---
+
+def _committed_block_ids(block_list_obj) -> List[str]:
+    """
+    Vrátí list block_id stringů z get_block_list().
+    Podporuje jak .id, tak .name (různé verze SDK).
+    """
+    ids: List[str] = []
+    if hasattr(block_list_obj, "committed_blocks") and block_list_obj.committed_blocks:
+        for b in block_list_obj.committed_blocks:
+            bid = getattr(b, "id", None) or getattr(b, "name", None)
+            if bid:
+                ids.append(bid)
+    elif isinstance(block_list_obj, list):
+        for b in block_list_obj:
+            if isinstance(b, str):
+                ids.append(b)
+            else:
+                bid = getattr(b, "id", None) or getattr(b, "name", None)
+                if bid:
+                    ids.append(bid)
+    return ids
+
+def _acquire_lease_with_retry(blob_client, attempts: int = 5, sleep_s: float = 0.2):
+    """
+    Získá krátký lease s pár rychlými retry pro případ souběhu.
+    """
+    from azure.storage.blob import BlobLeaseClient
+    last_exc = None
+    for _ in range(max(1, attempts)):
+        try:
+            lease = BlobLeaseClient(blob_client)
+            lease.acquire()  # ~60 s lease; držíme jen po dobu kritické sekce
+            return lease
+        except Exception as e:
+            last_exc = e
+            time.sleep(sleep_s)
+    if last_exc:
+        raise last_exc
+
 # --- Append řádek do textového blobu přes block list (S LEASE – bezpečný append) ---
 def _append_text_blob_blocklist(container_client, blob_name: str, text_to_append: str):
     """
-    Bezpečný append pro text: vezme krátký lease, až POTÉ načte committed block list,
-    přidá nový block a commitne kombinaci (staré bloky + nový). Tím se vyloučí závody,
-    které by vedly k „přepsání“ blobu posledním zápisem.
+    Bezpečný append: získá lease, až POTÉ načte committed block list,
+    přidá nový blok a commitne kombinaci (staré bloky + nový). Zabrání přepisování.
     """
-    from azure.storage.blob import BlobBlock, BlobLeaseClient
+    from azure.storage.blob import BlobBlock
     from azure.core.exceptions import ResourceNotFoundError
     import base64, secrets
 
     bc = container_client.get_blob_client(blob_name)
 
-    # vytvoř prázdný blob pokud neexistuje (bez přepsání)
+    # vytvoř blob, pokud neexistuje (bez přepsání)
     try:
         bc.get_blob_properties()
     except ResourceNotFoundError:
         try:
             bc.upload_blob(b"", overwrite=False)
         except Exception:
-            # souběh: někdo jiný ho právě vytvořil – nevadí
-            pass
+            pass  # souběh – někdo jiný už vytvořil
 
-    # krátký lease serializuje append
-    lease = BlobLeaseClient(bc)
-    lease.acquire()
+    lease = _acquire_lease_with_retry(bc)
 
     try:
-        # načti committed blocks až PO získání lease
+        # seznam existujících bloků až po získání lease
         bl = bc.get_block_list(block_list_type="committed", lease=lease)
-        committed_ids: List[str] = []
-        if hasattr(bl, "committed_blocks") and bl.committed_blocks:
-            committed_ids = [b.id for b in bl.committed_blocks if getattr(b, "id", None)]
-        elif isinstance(bl, list):
-            committed_ids = [getattr(b, "id", None) for b in bl if getattr(b, "id", None)]
+        committed_ids = _committed_block_ids(bl)
 
         # nový block
         block_id = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
         bc.stage_block(block_id=block_id, data=text_to_append.encode("utf-8"), lease=lease)
 
-        # commit: staré bloky + nový
-        from azure.storage.blob import BlobBlock
+        # commit: staré bloky + nový (klíčové, jinak by se přepsalo)
         new_list = [BlobBlock(bid) for bid in committed_ids] + [BlobBlock(block_id)]
         bc.commit_block_list(new_list, lease=lease)
     finally:
@@ -157,16 +195,14 @@ def _append_text_blob_blocklist(container_client, blob_name: str, text_to_append
 def _ensure_trade_header(logs_cc, blob_name: str, header: str):
     """
     Zajistí, že trade CSV má vždy hlavičku jako první řádek.
-    - pokud blob neexistuje → vytvoří s hlavičkou
-    - pokud je prázdný → zapíše hlavičku
-    - pokud existuje a hlavička chybí → stáhne celé tělo a přepíše na 'header + původní obsah'
+    Pokud existuje a hlavička chybí → prepend pod lease.
     """
     from azure.core.exceptions import ResourceNotFoundError
     from azure.storage.blob import BlobLeaseClient
 
     bc = logs_cc.get_blob_client(blob_name)
+    # pokus o vytvoření nového blobu s hlavičkou (bez přepsání)
     try:
-        # pokus o vytvoření nového blobu s hlavičkou (bez přepsání)
         bc.upload_blob(header.encode("utf-8"), overwrite=False)
         return
     except Exception:
@@ -176,7 +212,15 @@ def _ensure_trade_header(logs_cc, blob_name: str, header: str):
         props = bc.get_blob_properties()
         size = int(getattr(props, "size", 0) or 0)
         if size == 0:
-            bc.upload_blob(header.encode("utf-8"), overwrite=True)
+            # prázdný soubor → napiš hlavičku (pod lease pro jistotu)
+            lease = BlobLeaseClient(bc); lease.acquire()
+            try:
+                bc.upload_blob(header.encode("utf-8"), overwrite=True, lease=lease)
+            finally:
+                try:
+                    lease.release()
+                except Exception:
+                    pass
             return
 
         # ověř prefix
@@ -192,10 +236,16 @@ def _ensure_trade_header(logs_cc, blob_name: str, header: str):
                 full = bc.download_blob(lease=lease).readall()
                 bc.upload_blob(header.encode("utf-8") + full, overwrite=True, lease=lease)
             finally:
-                try: lease.release()
-                except Exception: pass
+                try:
+                    lease.release()
+                except Exception:
+                    pass
     except ResourceNotFoundError:
-        bc.upload_blob(header.encode("utf-8"), overwrite=False)
+        # závod: blob mezitím zanikl/vzniká – zkus znovu založit
+        try:
+            bc.upload_blob(header.encode("utf-8"), overwrite=False)
+        except Exception:
+            pass
 
 def _append_trade_line(logs_cc, blob_name: str, line: str):
     header = "time_utc,pair,model,side,executedQty,avgFillPrice,cummulativeQuoteQty,fee_total,fee_asset,orderId,b_level,s_level,b_signal_date\n"
@@ -204,32 +254,30 @@ def _append_trade_line(logs_cc, blob_name: str, line: str):
 
 # ====================== API log (1 soubor, hlavička + append bezpečně) ======================
 
-API_LOG_COLUMNS = ["ts","method","path","params","status","error","resp_sample"]
+API_LOG_COLUMNS = ["ts", "method", "path", "params", "status", "error", "resp_sample"]
 
 def _api_log_blob_name() -> str:
     return API_LOG_FILE_NAME  # jeden soubor pro všechny běhy
 
 def _csv_line(values: List[Any]) -> str:
     sio = io.StringIO()
-    w = csv.writer(sio, lineterminator="\n")
-    w.writerow(values)
+    csv.writer(sio, lineterminator="\n").writerow(values)
     return sio.getvalue()
 
 def _ensure_api_log_header(logs_cc):
     """
-    Atomicky zajistí hlavičku:
-    - Pokud blob neexistuje → vytvoří ho s hlavičkou (overwrite=False).
-    - Pokud existuje a je prázdný → zapíše hlavičku (overwrite=True).
-    - Pokud existuje a hlavička chybí → prepend s krátkým lease (zabrání závodu).
+    Zajistí hlavičku CSV atomicky:
+    - pokud blob neexistuje → vytvoří s hlavičkou (overwrite=False);
+    - pokud existuje a je prázdný → dopíše hlavičku pod lease;
+    - pokud existuje a hlavička chybí → prepend pod lease.
     """
     from azure.core.exceptions import ResourceNotFoundError
-    from azure.storage.blob import BlobLeaseClient
 
     blob_name = _api_log_blob_name()
     bc = logs_cc.get_blob_client(blob_name)
     header = _csv_line(API_LOG_COLUMNS)  # končí \n
 
-    # pokus o vytvoření nového blobu s hlavičkou (bez přepsání)
+    # 1) zkus vytvořit rovnou s hlavičkou
     try:
         bc.upload_blob(header.encode("utf-8"), overwrite=False)
         return
@@ -239,30 +287,33 @@ def _ensure_api_log_header(logs_cc):
     try:
         props = bc.get_blob_properties()
         size = int(getattr(props, "size", 0) or 0)
-        if size == 0:
-            bc.upload_blob(header.encode("utf-8"), overwrite=True)
-            return
 
-        # zkontroluj prefix
-        head = b""
+        lease = _acquire_lease_with_retry(bc)
         try:
-            head = bc.download_blob(offset=0, length=max(len(header), 1024)).readall()
-        except Exception:
+            if size == 0:
+                bc.upload_blob(header.encode("utf-8"), overwrite=True, lease=lease)
+                return
+
+            # zkontroluj prefix
             head = b""
-        if head.decode("utf-8", errors="ignore").startswith(header):
-            return  # hlavička už je OK
+            try:
+                head = bc.download_blob(offset=0, length=max(len(header), 1024), lease=lease).readall()
+            except Exception:
+                head = b""
+            if head.decode("utf-8", errors="ignore").startswith(header):
+                return
 
-        # hlavička chybí → prepend pod lease
-        lease = BlobLeaseClient(bc); lease.acquire()
-        try:
+            # prepend hlavičky
             full = bc.download_blob(lease=lease).readall()
             bc.upload_blob(header.encode("utf-8") + full, overwrite=True, lease=lease)
         finally:
-            try: lease.release()
-            except Exception: pass
+            try:
+                lease.release()
+            except Exception:
+                pass
 
     except ResourceNotFoundError:
-        # závod: blob mezitím zanikl/vzniká – zkus znovu vytvořit s hlavičkou
+        # závod: blob mezitím zmizel/vzniká – zkus znovu založit s hlavičkou
         try:
             bc.upload_blob(header.encode("utf-8"), overwrite=False)
         except Exception:
@@ -270,8 +321,8 @@ def _ensure_api_log_header(logs_cc):
 
 def _append_api_csv_row(logs_cc, row_values: List[Any]):
     """
-    Vždy nejdřív zajistí hlavičku (atomicky), pak teprve appendne řádek.
-    Append děláme přes block-list helper pod zámkem.
+    Vždy nejdřív zajistí hlavičku (atomicky), pak appendne řádek.
+    Append přes block-list helper pod lease.
     """
     _ensure_api_log_header(logs_cc)
     line = _csv_line(row_values)
@@ -309,19 +360,20 @@ def _append_api_csv(logs_cc, *, method: str, path: str, params: Dict[str, Any], 
 
 # ====================== Master CSV loader (1× za tik) ======================
 
-def _parse_pairs_models(val: str) -> List[Tuple[str,str]]:
+def _parse_pairs_models(val: str) -> List[Tuple[str, str]]:
     out = []
     for piece in val.split(","):
         piece = piece.strip()
-        if not piece or ":" not in piece: continue
-        pair, model = piece.split(":",1)
+        if not piece or ":" not in piece:
+            continue
+        pair, model = piece.split(":", 1)
         out.append((pair.strip().upper(), model.strip()))
     return out
 
-def _load_master_signals_map(models_cc) -> Dict[Tuple[str,str], Dict[str,Any]]:
+def _load_master_signals_map(models_cc) -> Dict[Tuple[str, str], Dict[str, Any]]:
     """
     Načte master CSV 1×, vyfiltruje is_active a prahy (MIN_CYCLES_PER_DAY, MIN_SCORE),
-    a pro každé (pair, model) vrátí poslední (podle date, load_time_utc) řádek s B/S.
+    a pro každé (pair, model) vrátí poslední řádek s B/S.
     """
     import pandas as pd
     from azure.core.exceptions import ResourceNotFoundError
@@ -334,23 +386,25 @@ def _load_master_signals_map(models_cc) -> Dict[Tuple[str,str], Dict[str,Any]]:
         return {}
 
     df = pd.read_csv(io.BytesIO(raw))
-    required = {"pair","model","B","S","date","load_time_utc","is_active","score"}
+    required = {"pair", "model", "B", "S", "date", "load_time_utc", "is_active", "score"}
     if not required.issubset(df.columns):
-        logger.error("Master CSV missing columns, have: %s", df.columns.tolist()); return {}
+        logger.error("Master CSV missing columns, have: %s", df.columns.tolist())
+        return {}
 
     # alias pro počet cyklů
     cycles_col = "cycles" if "cycles" in df.columns else ("total_cycles" if "total_cycles" in df.columns else None)
     if cycles_col is None:
-        logger.error("Master CSV musí obsahovat 'cycles' nebo 'total_cycles'."); return {}
+        logger.error("Master CSV musí obsahovat 'cycles' nebo 'total_cycles'.")
+        return {}
 
     # normalizace
     df["pair"] = df["pair"].astype(str).str.upper()
     df["model"] = df["model"].astype(str)
 
     # filtry
-    df = df[(df["is_active"]==True) &
+    df = df[(df["is_active"] == True) &
             (df[cycles_col] >= MIN_CYCLES_PER_DAY) &
-            (df["score"]  >= MIN_SCORE)].copy()
+            (df["score"] >= MIN_SCORE)].copy()
     if df.empty:
         return {}
 
@@ -358,11 +412,11 @@ def _load_master_signals_map(models_cc) -> Dict[Tuple[str,str], Dict[str,Any]]:
     df["load_time_utc"] = pd.to_datetime(df["load_time_utc"], errors="coerce", utc=True)
 
     # vezmi poslední per (pair, model)
-    df = df.sort_values(["pair","model","date","load_time_utc"])
-    latest = df.groupby(["pair","model"], as_index=False).tail(1)
+    df = df.sort_values(["pair", "model", "date", "load_time_utc"])
+    latest = df.groupby(["pair", "model"], as_index=False).tail(1)
 
     # výstupní mapa
-    out: Dict[Tuple[str,str], Dict[str,Any]] = {}
+    out: Dict[Tuple[str, str], Dict[str, Any]] = {}
     for _, r in latest.iterrows():
         key = (str(r["pair"]).upper(), str(r["model"]))
         out[key] = {
@@ -373,7 +427,7 @@ def _load_master_signals_map(models_cc) -> Dict[Tuple[str,str], Dict[str,Any]]:
             "date": str(r["date"]),
             "load_time_utc": (r["load_time_utc"].strftime("%Y-%m-%dT%H:%M:%SZ") if not pd.isna(r["load_time_utc"]) else None),
             "cycles": float(r[cycles_col]),
-            "score": float(r["score"])
+            "score": float(r["score"]),
         }
     return out
 
@@ -385,7 +439,7 @@ def _sign(query: str) -> str:
 def _ts() -> int:
     return int(time.time() * 1000)
 
-def _headers() -> Dict[str,str]:
+def _headers() -> Dict[str, str]:
     return {"X-MBX-APIKEY": BINANCE_API_KEY}
 
 def api_get(session: requests.Session, path: str, params: Dict[str, Any], *, logs_cc=None) -> Any:
@@ -443,13 +497,15 @@ def _pairs_only(val: str) -> List[str]:
     out = []
     for piece in val.split(","):
         piece = piece.strip()
-        if not piece or ":" not in piece: continue
-        pair, _ = piece.split(":",1)
+        if not piece or ":" not in piece:
+            continue
+        pair, _ = piece.split(":", 1)
         out.append(pair.strip().upper())
     # dedup
-    seen=set(); res=[]
+    seen = set(); res = []
     for p in out:
-        if p not in seen: seen.add(p); res.append(p)
+        if p not in seen:
+            seen.add(p); res.append(p)
     return res
 
 def _exchangeinfo_blob_name_for_today() -> str:
@@ -476,14 +532,20 @@ def _ensure_exchangeinfo_json_for_today(session: requests.Session, logs_cc, pair
         for f in sym.get("filters", []):
             ftype = f.get("filterType")
             if ftype == "PRICE_FILTER":
-                try: tick_size = float(f.get("tickSize"))
-                except: tick_size = None
+                try:
+                    tick_size = float(f.get("tickSize"))
+                except:
+                    tick_size = None
             elif ftype == "LOT_SIZE":
-                try: step_size = float(f.get("stepSize"))
-                except: step_size = None
+                try:
+                    step_size = float(f.get("stepSize"))
+                except:
+                    step_size = None
             elif ftype == "MIN_NOTIONAL":
-                try: min_notional = float(f.get("minNotional", "0") or 0)
-                except: min_notional = None
+                try:
+                    min_notional = float(f.get("minNotional", "0") or 0)
+                except:
+                    min_notional = None
         if sname:
             filt_map[sname.upper()] = {
                 "status": status,
@@ -512,7 +574,8 @@ def get_symbol_filters_cached(filters_json: Dict[str, Any], symbol: str) -> Tupl
     )
 
 def round_down_qty(qty: float, step: float) -> float:
-    if step <= 0: return qty
+    if step <= 0:
+        return qty
     return math.floor(qty / step) * step
 
 # ====================== Orders ======================
@@ -545,17 +608,19 @@ def _state_blob_name(pair: str, model: str) -> str:
 def _trade_log_blob_name(pair: str) -> str:
     return f"{pair}.csv"
 
-def _avg_fill_price(fills: List[Dict[str,Any]]) -> float:
-    if not fills: return 0.0
+def _avg_fill_price(fills: List[Dict[str, Any]]) -> float:
+    if not fills:
+        return 0.0
     total_qty = 0.0
     total_quote = 0.0
     for f in fills:
-        p = float(f["price"]); q = float(f["qty"])
+        p = float(f["price"])
+        q = float(f["qty"])
         total_qty += q
-        total_quote += p*q
-    return (total_quote / total_qty) if total_qty>0 else 0.0
+        total_quote += p * q
+    return (total_quote / total_qty) if total_qty > 0 else 0.0
 
-def _sum_fee(fills: List[Dict[str,Any]]) -> Tuple[float,str]:
+def _sum_fee(fills: List[Dict[str, Any]]) -> Tuple[float, str]:
     total = 0.0
     asset = None
     for f in fills:
@@ -570,12 +635,13 @@ def _fetch_prices_parallel(session: requests.Session, logs_cc, pairs: List[str])
     """
     Stáhne /ticker/price pro všechny páry paralelně, vrátí mapu {pair: price}.
     """
-    prices: Dict[str,float] = {}
+    prices: Dict[str, float] = {}
+
     def task(pair: str):
         return pair, get_price(session, pair, logs_cc=logs_cc)
 
     with ThreadPoolExecutor(max_workers=max(1, PRICE_FETCH_WORKERS)) as ex:
-        futs = { ex.submit(task, p): p for p in pairs }
+        futs = {ex.submit(task, p): p for p in pairs}
         for fut in as_completed(futs):
             p = futs[fut]
             try:
@@ -588,15 +654,16 @@ def _fetch_prices_parallel(session: requests.Session, logs_cc, pairs: List[str])
 def run_decision_for_pair(session: requests.Session,
                           models_cc, state_cc, logs_cc,
                           pair: str, model: str,
-                          sig_row: Optional[Dict[str,Any]],
-                          exch_cache: Dict[str,Any],
+                          sig_row: Optional[Dict[str, Any]],
+                          exch_cache: Dict[str, Any],
                           current_price: Optional[float]) -> None:
     # pokud nemáme platný signál, přeskoč
     if not sig_row:
         logger.info("[%s/%s] No active signal passing thresholds — skipping.", pair, model)
         return
 
-    B = float(sig_row["B"]); S = float(sig_row["S"])
+    B = float(sig_row["B"])
+    S = float(sig_row["S"])
 
     # načti stav
     s_name = _state_blob_name(pair, model)
@@ -625,8 +692,8 @@ def run_decision_for_pair(session: requests.Session,
     if st["position"] == "long" and px >= (st.get("s_level") or S):
         qty_sell = round_down_qty(float(st["qty"]), step)
         if qty_sell <= 0:
-            st = { "position":"flat", "qty":0.0, "entry_price":None, "entry_quote":0.0,
-                   "b_level":None, "s_level":None, "signal_date":None }
+            st = {"position": "flat", "qty": 0.0, "entry_price": None, "entry_quote": 0.0,
+                  "b_level": None, "s_level": None, "signal_date": None}
             _write_blob_json(state_cc, s_name, st)
             return
 
@@ -654,15 +721,15 @@ def run_decision_for_pair(session: requests.Session,
             f"{cq:.8f}",
             f"{fee_total:.8f}",
             fee_asset,
-            str(odr.get("orderId","")),
-            f"{st.get('b_level',0.0):.8f}",
-            f"{st.get('s_level',0.0):.8f}",
+            str(odr.get("orderId", "")),
+            f"{st.get('b_level', 0.0):.8f}",
+            f"{st.get('s_level', 0.0):.8f}",
             str(st.get("signal_date") or "")
         ]) + "\n"
         _append_trade_line(logs_cc, _trade_log_blob_name(pair), line)
 
-        st = { "position":"flat", "qty":0.0, "entry_price":None, "entry_quote":0.0,
-               "b_level":None, "s_level":None, "signal_date":None }
+        st = {"position": "flat", "qty": 0.0, "entry_price": None, "entry_quote": 0.0,
+              "b_level": None, "s_level": None, "signal_date": None}
         _write_blob_json(state_cc, s_name, st)
         logger.info("[%s/%s] SELL filled qty=%s avg=%.6f cq=%.6f", pair, model, executed_qty, avgp, cq)
         return
@@ -679,8 +746,8 @@ def run_decision_for_pair(session: requests.Session,
             logger.warning("[%s/%s] BUY order failed: %s", pair, model, e)
             return
 
-        executed_qty = float(odr.get("executedQty","0"))
-        cq = float(odr.get("cummulativeQuoteQty","0"))
+        executed_qty = float(odr.get("executedQty", "0"))
+        cq = float(odr.get("cummulativeQuoteQty", "0"))
         fills = odr.get("fills", []) or []
         avgp = _avg_fill_price(fills)
         fee_total, fee_asset = _sum_fee(fills)
@@ -692,7 +759,7 @@ def run_decision_for_pair(session: requests.Session,
             f"{cq:.8f}",
             f"{fee_total:.8f}",
             fee_asset,
-            str(odr.get("orderId","")),
+            str(odr.get("orderId", "")),
             f"{B:.8f}",
             f"{S:.8f}",
             str(sig_row.get("date") or "")
@@ -720,10 +787,14 @@ def main(mytimer: func.TimerRequest) -> None:
     try:
         _, models_cc, state_cc, logs_cc = _make_blob_clients()
 
+        # Založ hlavičku API logu hned na startu běhu (atomicky, pod lease při potřebě)
+        _ensure_api_log_header(logs_cc)
+
         # 0) Parsuj páry/modely + výpis pro diagnózu
         pairs_models = _parse_pairs_models(TRADE_PAIRS_MODELS)
         if not pairs_models:
-            logger.error("TRADE_PAIRS_MODELS is empty"); return
+            logger.error("TRADE_PAIRS_MODELS is empty")
+            return
         pairs = sorted({p for (p, _m) in pairs_models})
         logger.info("Parsed %d pairs, %d pair-model combos", len(pairs), len(pairs_models))
 
