@@ -102,39 +102,55 @@ def _write_blob_json(cc, name: str, obj: Dict[str, Any]) -> None:
         overwrite=True
     )
 
-# --- Append řádek do textového blobu přes block list (bez download) ---
+# --- Append řádek do textového blobu přes block list (S LEASE – bezpečný append) ---
 def _append_text_blob_blocklist(container_client, blob_name: str, text_to_append: str):
     """
-    Bezpečný append pro text: stáhne jen seznam commited block IDs, přidá nový block a commitne.
-    Funguje na BlockBlob (nenutí AppendBlob).
+    Bezpečný append pro text: vezme krátký lease, až POTÉ načte committed block list,
+    přidá nový block a commitne kombinaci (staré bloky + nový). Tím se vyloučí závody,
+    které by vedly k „přepsání“ blobu posledním zápisem.
     """
-    from azure.storage.blob import BlobBlock
+    from azure.storage.blob import BlobBlock, BlobLeaseClient
     from azure.core.exceptions import ResourceNotFoundError
     import base64, secrets
 
     bc = container_client.get_blob_client(blob_name)
 
-    # pokud blob neexistuje, vytvoř prázdný
+    # vytvoř prázdný blob pokud neexistuje (bez přepsání)
     try:
         bc.get_blob_properties()
     except ResourceNotFoundError:
-        bc.upload_blob(b"", overwrite=True)
+        try:
+            bc.upload_blob(b"", overwrite=False)
+        except Exception:
+            # souběh: někdo jiný ho právě vytvořil – nevadí
+            pass
 
-    # získej existující block list
-    bl = bc.get_block_list(block_list_type="committed")
-    committed = []
-    if hasattr(bl, "committed_blocks") and bl.committed_blocks:
-        committed = [b.id for b in bl.committed_blocks if getattr(b, "id", None)]
-    elif isinstance(bl, list):
-        committed = [getattr(b, "id", None) for b in bl if getattr(b, "id", None)]
+    # krátký lease serializuje append
+    lease = BlobLeaseClient(bc)
+    lease.acquire()
 
-    # nový block
-    block_id = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
-    bc.stage_block(block_id=block_id, data=text_to_append.encode("utf-8"))
+    try:
+        # načti committed blocks až PO získání lease
+        bl = bc.get_block_list(block_list_type="committed", lease=lease)
+        committed_ids: List[str] = []
+        if hasattr(bl, "committed_blocks") and bl.committed_blocks:
+            committed_ids = [b.id for b in bl.committed_blocks if getattr(b, "id", None)]
+        elif isinstance(bl, list):
+            committed_ids = [getattr(b, "id", None) for b in bl if getattr(b, "id", None)]
 
-    # commit combined
-    new_list = [BlobBlock(bid) for bid in committed] + [BlobBlock(block_id)]
-    bc.commit_block_list(new_list)
+        # nový block
+        block_id = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
+        bc.stage_block(block_id=block_id, data=text_to_append.encode("utf-8"), lease=lease)
+
+        # commit: staré bloky + nový
+        from azure.storage.blob import BlobBlock
+        new_list = [BlobBlock(bid) for bid in committed_ids] + [BlobBlock(block_id)]
+        bc.commit_block_list(new_list, lease=lease)
+    finally:
+        try:
+            lease.release()
+        except Exception:
+            pass
 
 # ====================== TRADE CSV (hlavička + append) ======================
 
@@ -146,8 +162,16 @@ def _ensure_trade_header(logs_cc, blob_name: str, header: str):
     - pokud existuje a hlavička chybí → stáhne celé tělo a přepíše na 'header + původní obsah'
     """
     from azure.core.exceptions import ResourceNotFoundError
+    from azure.storage.blob import BlobLeaseClient
 
     bc = logs_cc.get_blob_client(blob_name)
+    try:
+        # pokus o vytvoření nového blobu s hlavičkou (bez přepsání)
+        bc.upload_blob(header.encode("utf-8"), overwrite=False)
+        return
+    except Exception:
+        pass
+
     try:
         props = bc.get_blob_properties()
         size = int(getattr(props, "size", 0) or 0)
@@ -155,7 +179,7 @@ def _ensure_trade_header(logs_cc, blob_name: str, header: str):
             bc.upload_blob(header.encode("utf-8"), overwrite=True)
             return
 
-        # přečti prvních pár bajtů a ověř hlavičku
+        # ověř prefix
         head = b""
         try:
             head = bc.download_blob(offset=0, length=max(256, len(header))).readall()
@@ -163,18 +187,22 @@ def _ensure_trade_header(logs_cc, blob_name: str, header: str):
             head = b""
         head_txt = head.decode("utf-8", errors="ignore")
         if not head_txt.startswith(header):
-            full = bc.download_blob().readall()
-            new_body = header.encode("utf-8") + full
-            bc.upload_blob(new_body, overwrite=True)
+            lease = BlobLeaseClient(bc); lease.acquire()
+            try:
+                full = bc.download_blob(lease=lease).readall()
+                bc.upload_blob(header.encode("utf-8") + full, overwrite=True, lease=lease)
+            finally:
+                try: lease.release()
+                except Exception: pass
     except ResourceNotFoundError:
-        bc.upload_blob(header.encode("utf-8"), overwrite=True)
+        bc.upload_blob(header.encode("utf-8"), overwrite=False)
 
 def _append_trade_line(logs_cc, blob_name: str, line: str):
     header = "time_utc,pair,model,side,executedQty,avgFillPrice,cummulativeQuoteQty,fee_total,fee_asset,orderId,b_level,s_level,b_signal_date\n"
     _ensure_trade_header(logs_cc, blob_name, header)
     _append_text_blob_blocklist(logs_cc, blob_name, line)
 
-# ====================== API log (jeden soubor, hlavička + append přes block-list) ======================
+# ====================== API log (1 soubor, hlavička + append bezpečně) ======================
 
 API_LOG_COLUMNS = ["ts","method","path","params","status","error","resp_sample"]
 
@@ -189,11 +217,10 @@ def _csv_line(values: List[Any]) -> str:
 
 def _ensure_api_log_header(logs_cc):
     """
-    Vytvoří hlavičku CSV atomicky:
-    - Pokud blob neexistuje → vytvoří ho s hlavičkou (overwrite=False) – závod řeší storage (Etag/412).
-    - Pokud existuje a je prázdný → doplní hlavičku.
-    - Pokud existuje a hlavička chybí → stáhne obsah, vezme krátký lease, nahraje 'header + původní obsah'.
-      Lease zamezí závodům s append bloky.
+    Atomicky zajistí hlavičku:
+    - Pokud blob neexistuje → vytvoří ho s hlavičkou (overwrite=False).
+    - Pokud existuje a je prázdný → zapíše hlavičku (overwrite=True).
+    - Pokud existuje a hlavička chybí → prepend s krátkým lease (zabrání závodu).
     """
     from azure.core.exceptions import ResourceNotFoundError
     from azure.storage.blob import BlobLeaseClient
@@ -202,57 +229,49 @@ def _ensure_api_log_header(logs_cc):
     bc = logs_cc.get_blob_client(blob_name)
     header = _csv_line(API_LOG_COLUMNS)  # končí \n
 
+    # pokus o vytvoření nového blobu s hlavičkou (bez přepsání)
     try:
-        # 1) pokus o vytvoření nového blobu jen s hlavičkou (bez přepsání)
         bc.upload_blob(header.encode("utf-8"), overwrite=False)
-        return  # hotovo – blob vznikl právě teď s hlavičkou
+        return
     except Exception:
-        # už existuje, pokračuj kontrolou obsahu
-        pass
+        pass  # už existuje
 
     try:
         props = bc.get_blob_properties()
         size = int(getattr(props, "size", 0) or 0)
         if size == 0:
-            # prázdný → jednoduše dopiš hlavičku (bez lease je to OK, data ještě nejsou)
             bc.upload_blob(header.encode("utf-8"), overwrite=True)
             return
 
-        # ověř prefix (prvních max(1024, len(header)) bajtů)
+        # zkontroluj prefix
         head = b""
         try:
             head = bc.download_blob(offset=0, length=max(len(header), 1024)).readall()
         except Exception:
             head = b""
-        head_txt = head.decode("utf-8", errors="ignore")
+        if head.decode("utf-8", errors="ignore").startswith(header):
+            return  # hlavička už je OK
 
-        if head_txt.startswith(header):
-            return  # hlavička už je v pořádku
-
-        # 2) Hlavička chybí → prepend s lease, aby se nám do toho nikdo nevpisoval
-        lease = BlobLeaseClient(bc)
-        lease.acquire()  # krátký výchozí lease (~60 s)
-
+        # hlavička chybí → prepend pod lease
+        lease = BlobLeaseClient(bc); lease.acquire()
         try:
-            full = bc.download_blob().readall()
+            full = bc.download_blob(lease=lease).readall()
             bc.upload_blob(header.encode("utf-8") + full, overwrite=True, lease=lease)
         finally:
-            try:
-                lease.release()
-            except Exception:
-                pass
+            try: lease.release()
+            except Exception: pass
 
     except ResourceNotFoundError:
-        # Závod: jiný thread blob právě smazal/vytváří. Zkus znovu vytvořit s hlavičkou.
+        # závod: blob mezitím zanikl/vzniká – zkus znovu vytvořit s hlavičkou
         try:
             bc.upload_blob(header.encode("utf-8"), overwrite=False)
         except Exception:
-            pass  # pokud mezitím vznikl, nevadí
+            pass
 
 def _append_api_csv_row(logs_cc, row_values: List[Any]):
     """
     Vždy nejdřív zajistí hlavičku (atomicky), pak teprve appendne řádek.
-    Append děláme přes block-list helper.
+    Append děláme přes block-list helper pod zámkem.
     """
     _ensure_api_log_header(logs_cc)
     line = _csv_line(row_values)
@@ -268,13 +287,13 @@ def _sanitize_params(p: Dict[str, Any]) -> Dict[str, Any]:
 def _append_api_csv(logs_cc, *, method: str, path: str, params: Dict[str, Any], status: Any, error: Optional[str], resp_text: Optional[str]):
     if not API_CSV_LOGGING:
         return
-    # bezpečná serializace + zkrácení vzorku odpovědi
+    # bezpečná serializace + zkrácení vzorku odpovědi + bez newline
     par = _sanitize_params(params or {})
     params_ser = json.dumps(par, ensure_ascii=False, separators=(",", ":"))
+
     sample = (resp_text or "")
     if isinstance(sample, str) and len(sample) > 1000:
         sample = sample[:1000] + "..."
-    # odstranění nových řádků, aby to zůstalo v 1 CSV řádku
     sample = sample.replace("\r", " ").replace("\n", " ")
 
     row = [
