@@ -189,37 +189,71 @@ def _csv_line(values: List[Any]) -> str:
 
 def _ensure_api_log_header(logs_cc):
     """
-    Zajistí, že API log CSV má vždy hlavičku jako první řádek (BlockBlob varianta).
-    - pokud blob neexistuje → vytvoří s hlavičkou
-    - pokud je prázdný → zapíše hlavičku
-    - pokud existuje a hlavička chybí → stáhne celé tělo a přepíše na 'header + původní obsah'
+    Vytvoří hlavičku CSV atomicky:
+    - Pokud blob neexistuje → vytvoří ho s hlavičkou (overwrite=False) – závod řeší storage (Etag/412).
+    - Pokud existuje a je prázdný → doplní hlavičku.
+    - Pokud existuje a hlavička chybí → stáhne obsah, vezme krátký lease, nahraje 'header + původní obsah'.
+      Lease zamezí závodům s append bloky.
     """
     from azure.core.exceptions import ResourceNotFoundError
+    from azure.storage.blob import BlobLeaseClient
+
     blob_name = _api_log_blob_name()
     bc = logs_cc.get_blob_client(blob_name)
-    header = _csv_line(API_LOG_COLUMNS)
+    header = _csv_line(API_LOG_COLUMNS)  # končí \n
+
+    try:
+        # 1) pokus o vytvoření nového blobu jen s hlavičkou (bez přepsání)
+        bc.upload_blob(header.encode("utf-8"), overwrite=False)
+        return  # hotovo – blob vznikl právě teď s hlavičkou
+    except Exception:
+        # už existuje, pokračuj kontrolou obsahu
+        pass
 
     try:
         props = bc.get_blob_properties()
         size = int(getattr(props, "size", 0) or 0)
         if size == 0:
+            # prázdný → jednoduše dopiš hlavičku (bez lease je to OK, data ještě nejsou)
             bc.upload_blob(header.encode("utf-8"), overwrite=True)
             return
 
-        # ověř prefix
+        # ověř prefix (prvních max(1024, len(header)) bajtů)
         head = b""
         try:
             head = bc.download_blob(offset=0, length=max(len(header), 1024)).readall()
         except Exception:
             head = b""
         head_txt = head.decode("utf-8", errors="ignore")
-        if not head_txt.startswith(header):
+
+        if head_txt.startswith(header):
+            return  # hlavička už je v pořádku
+
+        # 2) Hlavička chybí → prepend s lease, aby se nám do toho nikdo nevpisoval
+        lease = BlobLeaseClient(bc)
+        lease.acquire()  # krátký výchozí lease (~60 s)
+
+        try:
             full = bc.download_blob().readall()
-            bc.upload_blob(header.encode("utf-8") + full, overwrite=True)
+            bc.upload_blob(header.encode("utf-8") + full, overwrite=True, lease=lease)
+        finally:
+            try:
+                lease.release()
+            except Exception:
+                pass
+
     except ResourceNotFoundError:
-        bc.upload_blob(header.encode("utf-8"), overwrite=True)
+        # Závod: jiný thread blob právě smazal/vytváří. Zkus znovu vytvořit s hlavičkou.
+        try:
+            bc.upload_blob(header.encode("utf-8"), overwrite=False)
+        except Exception:
+            pass  # pokud mezitím vznikl, nevadí
 
 def _append_api_csv_row(logs_cc, row_values: List[Any]):
+    """
+    Vždy nejdřív zajistí hlavičku (atomicky), pak teprve appendne řádek.
+    Append děláme přes block-list helper.
+    """
     _ensure_api_log_header(logs_cc)
     line = _csv_line(row_values)
     _append_text_blob_blocklist(logs_cc, _api_log_blob_name(), line)
@@ -234,12 +268,14 @@ def _sanitize_params(p: Dict[str, Any]) -> Dict[str, Any]:
 def _append_api_csv(logs_cc, *, method: str, path: str, params: Dict[str, Any], status: Any, error: Optional[str], resp_text: Optional[str]):
     if not API_CSV_LOGGING:
         return
-    # bezpečná serializace
+    # bezpečná serializace + zkrácení vzorku odpovědi
     par = _sanitize_params(params or {})
     params_ser = json.dumps(par, ensure_ascii=False, separators=(",", ":"))
     sample = (resp_text or "")
     if isinstance(sample, str) and len(sample) > 1000:
         sample = sample[:1000] + "..."
+    # odstranění nových řádků, aby to zůstalo v 1 CSV řádku
+    sample = sample.replace("\r", " ").replace("\n", " ")
 
     row = [
         datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -248,7 +284,7 @@ def _append_api_csv(logs_cc, *, method: str, path: str, params: Dict[str, Any], 
         params_ser,
         str(status or ""),
         (error or ""),
-        sample.replace("\r"," ").replace("\n"," "),
+        sample,
     ]
     _append_api_csv_row(logs_cc, row)
 
