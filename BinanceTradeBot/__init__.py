@@ -174,7 +174,7 @@ def _append_trade_line(logs_cc, blob_name: str, line: str):
     _ensure_trade_header(logs_cc, blob_name, header)
     _append_text_blob_blocklist(logs_cc, blob_name, line)
 
-# ====================== API log (jeden soubor, hlavička + append) ======================
+# ====================== API log (jeden soubor, hlavička + append přes block-list) ======================
 
 API_LOG_COLUMNS = ["ts","method","path","params","status","error","resp_sample"]
 
@@ -187,73 +187,55 @@ def _csv_line(values: List[Any]) -> str:
     w.writerow(values)
     return sio.getvalue()
 
-def _ensure_api_log_append_blob(logs_cc):
+def _ensure_api_log_header(logs_cc):
     """
-    Zajistí AppendBlob s platnou hlavičkou pro API log.
-    - pokud blob neexistuje → create_append_blob + hlavička
-    - pokud existuje a hlavička chybí → migrace: HLAVIČKA + původní obsah
-    - pokud existuje s hlavičkou → nic
-    - pokud je typu BlockBlob → převede na AppendBlob (zachová data)
+    Zajistí, že API log CSV má vždy hlavičku jako první řádek (BlockBlob varianta).
+    - pokud blob neexistuje → vytvoří s hlavičkou
+    - pokud je prázdný → zapíše hlavičku
+    - pokud existuje a hlavička chybí → stáhne celé tělo a přepíše na 'header + původní obsah'
     """
     from azure.core.exceptions import ResourceNotFoundError
-    bc = logs_cc.get_blob_client(_api_log_blob_name())
+    blob_name = _api_log_blob_name()
+    bc = logs_cc.get_blob_client(blob_name)
     header = _csv_line(API_LOG_COLUMNS)
 
     try:
         props = bc.get_blob_properties()
-        blob_type = str(getattr(props, "blob_type", "")).lower()
         size = int(getattr(props, "size", 0) or 0)
-
-        # stáhni začátek pro ověření hlavičky
-        head = b""
-        if size > 0:
-            try:
-                head = bc.download_blob(offset=0, length=max(len(header), 1024)).readall()
-            except Exception:
-                head = b""
-        head_text = head.decode("utf-8", errors="ignore")
-
-        if blob_type != "appendblob":
-            # převod na AppendBlob + zachování dat + doplnění hlavičky
-            full = bc.download_blob().readall() if size > 0 else b""
-            bc.delete_blob()
-            bc.create_append_blob()
-            if not head_text.startswith(header):
-                bc.append_block(header.encode("utf-8"))
-            if full:
-                bc.append_block(full)
-            return
-
-        # je to AppendBlob
         if size == 0:
-            bc.append_block(header.encode("utf-8"))
+            bc.upload_blob(header.encode("utf-8"), overwrite=True)
             return
-        if not head_text.startswith(header):
-            full = bc.download_blob().readall()
-            bc.delete_blob()
-            bc.create_append_blob()
-            bc.append_block(header.encode("utf-8"))
-            if full:
-                bc.append_block(full)
-        return
 
+        # ověř prefix
+        head = b""
+        try:
+            head = bc.download_blob(offset=0, length=max(len(header), 1024)).readall()
+        except Exception:
+            head = b""
+        head_txt = head.decode("utf-8", errors="ignore")
+        if not head_txt.startswith(header):
+            full = bc.download_blob().readall()
+            bc.upload_blob(header.encode("utf-8") + full, overwrite=True)
     except ResourceNotFoundError:
-        # neexistuje → založ s hlavičkou
-        bc.create_append_blob()
-        bc.append_block(header.encode("utf-8"))
-        return
+        bc.upload_blob(header.encode("utf-8"), overwrite=True)
 
 def _append_api_csv_row(logs_cc, row_values: List[Any]):
-    _ensure_api_log_append_blob(logs_cc)
+    _ensure_api_log_header(logs_cc)
     line = _csv_line(row_values)
-    logs_cc.get_blob_client(_api_log_blob_name()).append_block(line.encode("utf-8"))
+    _append_text_blob_blocklist(logs_cc, _api_log_blob_name(), line)
+
+def _sanitize_params(p: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(p, dict):
+        return {}
+    cleaned = dict(p)
+    cleaned.pop("signature", None)
+    return cleaned
 
 def _append_api_csv(logs_cc, *, method: str, path: str, params: Dict[str, Any], status: Any, error: Optional[str], resp_text: Optional[str]):
     if not API_CSV_LOGGING:
         return
     # bezpečná serializace
-    par = dict(params or {})
-    par.pop("signature", None)
+    par = _sanitize_params(params or {})
     params_ser = json.dumps(par, ensure_ascii=False, separators=(",", ":"))
     sample = (resp_text or "")
     if isinstance(sample, str) and len(sample) > 1000:
@@ -308,7 +290,7 @@ def _load_master_signals_map(models_cc) -> Dict[Tuple[str,str], Dict[str,Any]]:
 
     # normalizace
     df["pair"] = df["pair"].astype(str).str.upper()
-    df["model"] = df["model"].astype str
+    df["model"] = df["model"].astype(str)
 
     # filtry
     df = df[(df["is_active"]==True) &
