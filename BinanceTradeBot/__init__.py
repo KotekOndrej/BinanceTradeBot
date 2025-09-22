@@ -205,7 +205,9 @@ def _append_trade_line(logs_cc, blob_name: str, line: str):
 API_LOG_COLUMNS = ["ts","method","path","params","status","error","resp_sample"]
 
 def _api_log_blob_name() -> str:
-    return API_LOG_FILE_NAME  # jeden soubor pro všechny běhy
+    # Denní rotace: api_calls_YYYY_MM_DD.csv (UTC)
+    date_str = datetime.now(timezone.utc).strftime("%Y_%m_%d")
+    return f"api_calls_{date_str}.csv"
 
 def _csv_line(values: List[Any]) -> str:
     sio = io.StringIO()
