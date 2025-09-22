@@ -532,6 +532,35 @@ def round_down_qty(qty: float, step: float) -> float:
         return qty
     return math.floor(qty / step) * step
 
+def _egress_ip_info():
+    """
+    Zaloguju aktuální odchozí veřejnou IP a kontext (BASE_URL, USE_TESTNET).
+    Používám 2 jednoduché služby, aby to bylo robustní, a nikdy to neshodí běh.
+    """
+    ip = None
+    try:
+        ip = requests.get("https://api.ipify.org?format=json", timeout=5).json().get("ip")
+    except Exception as e:
+        logger.warning("ipify failed: %s", e)
+
+    if not ip:
+        try:
+            ip = requests.get("https://ifconfig.me/ip", timeout=5).text.strip()
+        except Exception as e:
+            logger.warning("ifconfig.me failed: %s", e)
+
+    # pro lepší diagnostiku ještě zkusíme vypsat, na jaké IP se resolvuje BASE_URL
+    try:
+        import socket, urllib.parse
+        host = urllib.parse.urlparse(BASE_URL).netloc or BASE_URL.split("://", 1)[-1]
+        addrs = sorted({ai[4][0] for ai in socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)})
+        resolved = ", ".join(addrs)
+    except Exception:
+        resolved = "n/a"
+
+    logger.info("Outbound IP=%s | BASE_URL=%s | USE_TESTNET=%s | DNS(%s)=%s",
+                ip, BASE_URL, USE_TESTNET,
+                (urllib.parse.urlparse(BASE_URL).netloc or BASE_URL), resolved)
 # ====================== Orders ======================
 
 def place_market_buy_quote(session: requests.Session, symbol: str, quote_usdt: float, *, logs_cc=None) -> Dict[str, Any]:
@@ -750,6 +779,7 @@ def main(mytimer: func.TimerRequest) -> None:
         # 1) Session reuse
         session = requests.Session()
 
+        _egress_ip_info()
         # 2) exchangeInfo cache 1× denně
         exchangeinfo_today = _ensure_exchangeinfo_json_for_today(session, logs_cc, pairs)
 
