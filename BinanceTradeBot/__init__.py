@@ -150,13 +150,45 @@ def _api_csv_blob_name() -> str:
     return f"api_calls_{today}.csv"
 
 def _ensure_api_csv_header(logs_cc):
+    """
+    Zajistí, že API log CSV má vždy hlavičku jako první řádek.
+    - pokud blob neexistuje → vytvoří s hlavičkou
+    - pokud je prázdný → zapíše hlavičku
+    - pokud existuje a hlavička chybí → stáhne celé tělo a přepíše na HLAVIČKA + původní obsah
+    """
     from azure.core.exceptions import ResourceNotFoundError
-    bc = logs_cc.get_blob_client(_api_csv_blob_name())
+
+    blob_name = _api_csv_blob_name()
+    header = "ts,method,path,params,status,error,resp_sample\n"
+    bc = logs_cc.get_blob_client(blob_name)
+
     try:
-        bc.get_blob_properties()
+        props = bc.get_blob_properties()
+        size = int(getattr(props, "size", 0) or 0)
+
+        # prázdný soubor → zapiš hlavičku
+        if size == 0:
+            bc.upload_blob(header.encode("utf-8"), overwrite=True)
+            return
+
+        # načti začátek a ověř hlavičku
+        head_bytes = b""
+        try:
+            head_bytes = bc.download_blob(offset=0, length=max(1024, len(header))).readall()
+        except Exception:
+            head_bytes = b""
+        head_text = head_bytes.decode("utf-8", errors="ignore")
+
+        if not head_text.startswith(header):
+            # migrace: HLAVIČKA + původní obsah
+            full = bc.download_blob().readall()
+            bc.upload_blob(header.encode("utf-8") + full, overwrite=True)
+        return
+
     except ResourceNotFoundError:
-        header = "ts,method,path,params,status,error,resp_sample\n"
+        # blob neexistuje → vytvoř s hlavičkou
         bc.upload_blob(header.encode("utf-8"), overwrite=True)
+        return
 
 def _sanitize_params(p: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(p, dict):
