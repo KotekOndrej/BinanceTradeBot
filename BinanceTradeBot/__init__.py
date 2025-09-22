@@ -154,7 +154,7 @@ def _ensure_api_csv_header(logs_cc):
     Zajistí, že API log CSV má vždy hlavičku jako první řádek.
     - pokud blob neexistuje → vytvoří s hlavičkou
     - pokud je prázdný → zapíše hlavičku
-    - pokud existuje a hlavička chybí → stáhne celé tělo a přepíše na HLAVIČKA + původní obsah
+    - pokud existuje a hlavička chybí → HLAVIČKA + původní obsah (migrace)
     """
     from azure.core.exceptions import ResourceNotFoundError
 
@@ -166,22 +166,21 @@ def _ensure_api_csv_header(logs_cc):
         props = bc.get_blob_properties()
         size = int(getattr(props, "size", 0) or 0)
 
-        # prázdný soubor → zapiš hlavičku
         if size == 0:
+            # prázdný → napiš jen hlavičku
             bc.upload_blob(header.encode("utf-8"), overwrite=True)
             return
 
-        # načti začátek a ověř hlavičku
+        # ověř začátek souboru (prefix, aby nevadilo \r\n vs \n)
         head_bytes = b""
         try:
             head_bytes = bc.download_blob(offset=0, length=max(1024, len(header))).readall()
         except Exception:
             head_bytes = b""
-        head_text = head_bytes.decode("utf-8", errors="ignore")
 
+        head_text = head_bytes.decode("utf-8", errors="ignore")
         if not head_text.startswith(header):
-            # migrace: HLAVIČKA + původní obsah
-            full = bc.download_blob().readall()
+            full = bc.download_blob().readall()  # původní tělo
             bc.upload_blob(header.encode("utf-8") + full, overwrite=True)
         return
 
@@ -200,12 +199,17 @@ def _sanitize_params(p: Dict[str, Any]) -> Dict[str, Any]:
 def _append_api_csv(logs_cc, *, method: str, path: str, params: Dict[str, Any], status: Any, error: Optional[str], resp_text: Optional[str]):
     if not API_CSV_LOGGING:
         return
-    _ensure_api_csv_header(logs_cc)
-    # omez výstup
+
+    blob_name = _api_csv_blob_name()
+    _ensure_api_csv_header(logs_cc)  # ← vždy zajistí hlavičku
+
+    # serializace s omezením délky
     params_ser = json.dumps(_sanitize_params(params or {}), ensure_ascii=False, separators=(",", ":"))
     resp_sample = (resp_text or "")
     if isinstance(resp_sample, str) and len(resp_sample) > 1000:
         resp_sample = resp_sample[:1000] + "..."
+
+    # řádek CSV (bez hlavičky)
     line = ",".join([
         datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         method,
@@ -215,7 +219,9 @@ def _append_api_csv(logs_cc, *, method: str, path: str, params: Dict[str, Any], 
         (error or "").replace("\n"," ").replace("\r"," "),
         resp_sample.replace("\n"," ").replace("\r"," ")
     ]) + "\n"
-    _append_text_blob_blocklist(logs_cc, _api_csv_blob_name(), line)
+
+    # append přes block list (stejný helper jako pro trade CSV)
+    _append_text_blob_blocklist(logs_cc, blob_name, line)
 
 # ====================== Master CSV loader (1× za tik) ======================
 
