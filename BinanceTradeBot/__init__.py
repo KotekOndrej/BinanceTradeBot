@@ -186,9 +186,9 @@ def _append_trade_line(logs_cc, blob_name: str, line: str):
 API_LOG_COLUMNS = ["ts","method","path","params","status","error","resp_sample"]
 
 def _api_log_blob_name() -> str:
-    # Denní rotace: api_calls_YYYY_MM_DD.csv (UTC)
-    date_str = datetime.now(timezone.utc).strftime("%Y_%m_%d")
-    return f"api_calls_{date_str}.csv"
+    # Hodinová rotace: api_calls_YYYY_MM_DD_HH.csv (UTC)
+    datehour = datetime.now(timezone.utc).strftime("%Y_%m_%d_%H")
+    return f"api_calls_{datehour}.csv"
 
 def _csv_line(values: List[Any]) -> str:
     sio = io.StringIO()
