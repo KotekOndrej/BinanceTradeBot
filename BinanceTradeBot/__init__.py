@@ -188,7 +188,8 @@ API_LOG_COLUMNS = ["ts","method","path","params","status","error","resp_sample"]
 def _api_log_blob_name() -> str:
     # Hodinová rotace: api_calls_YYYY_MM_DD_HH.csv (UTC)
     datehour = datetime.now(timezone.utc).strftime("%Y_%m_%d_%H")
-    return f"logs/api_calls_{datehour}.csv"
+    date = datetime.now(timezone.utc).strftime("%Y_%m_%d")
+    return f"logs/{date}/api_calls_{datehour}.csv"
 
 def _csv_line(values: List[Any]) -> str:
     sio = io.StringIO()
