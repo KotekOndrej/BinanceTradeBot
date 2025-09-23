@@ -360,7 +360,17 @@ def _load_master_signals_map(models_cc) -> Dict[Tuple[str, str], Dict[str, Any]]
     return out
 
 # ====================== Binance REST helpers (Session + CSV log) ======================
-
+def _get_price_with_retry(session: requests.Session, symbol: str, *, logs_cc=None, attempts: int = 2, delay: float = 0.3) -> float:
+    last_exc = None
+    for _ in range(max(1, attempts)):
+        try:
+            return get_price(session, symbol, logs_cc=logs_cc)
+        except Exception as e:
+            last_exc = e
+            try: time.sleep(delay)
+            except Exception: pass
+    raise last_exc
+    
 def _sign(query: str) -> str:
     return hmac.new(BINANCE_API_SECRET.encode("utf-8"), query.encode("utf-8"), hashlib.sha256).hexdigest()
 
@@ -596,8 +606,14 @@ def run_decision_for_pair(session: requests.Session,
 
     # cena
     if current_price is None:
-        logger.warning("[%s/%s] Missing current price → skip.", pair, model)
-        return
+        try:
+            current_price = _get_price_with_retry(session, pair, logs_cc=logs_cc, attempts=2, delay=0.3)
+            logger.info("[%s/%s] price retry OK: %.8f", pair, model, float(current_price))
+        except Exception as e:
+            _status = get_symbol_filters_cached(exch_cache, pair)[3]
+            logger.warning("[%s/%s] Missing current price after retry (status=%s) → skip. reason=%s",
+                           pair, model, _status, e)
+            return
     px = float(current_price)
 
     # filtry
