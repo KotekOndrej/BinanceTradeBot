@@ -113,7 +113,7 @@ def _trade_log_blob_name(pair: str) -> str:
 
 _TRADE_HEADER = "time_utc,pair,model,side,executedQty,avgFillPrice,cummulativeQuoteQty,fee_total,fee_asset,orderId,b_level,s_level,b_signal_date\n"
 
-def _ensure_trade_log_append_blob_with_header(logs_cc, pair: str):
+def _ensure_trade_log_append_blob_with_header(logs_cc, blob_name: str):
     """
     Zajistí, že trade log pro daný pár je Append Blob s hlavičkou na prvním řádku.
     Jednorázově opraví staré soubory bez hlavičky nebo jiné blob typy.
@@ -177,7 +177,7 @@ def _ensure_trade_log_append_blob_with_header(logs_cc, pair: str):
 
 def _append_trade_line(logs_cc, blob_name: str, line: str):
     pair = blob_name.replace(".csv", "")
-    _ensure_trade_log_append_blob_with_header(logs_cc, pair)
+    _ensure_trade_log_append_blob_with_header(logs_cc, blob_name)
     bc = logs_cc.get_blob_client(blob_name)
     bc.append_block(line.encode("utf-8"))
 
@@ -188,7 +188,7 @@ API_LOG_COLUMNS = ["ts","method","path","params","status","error","resp_sample"]
 def _api_log_blob_name() -> str:
     # Hodinová rotace: api_calls_YYYY_MM_DD_HH.csv (UTC)
     datehour = datetime.now(timezone.utc).strftime("%Y_%m_%d_%H")
-    return f"api_calls_{datehour}.csv"
+    return f"logs/api_calls_{datehour}.csv"
 
 def _csv_line(values: List[Any]) -> str:
     sio = io.StringIO()
@@ -578,7 +578,7 @@ def _fetch_prices_parallel(session: requests.Session, logs_cc, pairs: List[str])
     return prices
 
 def _trade_log_blob_name(pair: str) -> str:
-    return f"{pair}.csv"
+    return f"trades/{pair}.csv"
 
 def run_decision_for_pair(session: requests.Session,
                           models_cc, state_cc, logs_cc,
