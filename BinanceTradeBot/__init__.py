@@ -1,799 +1,564 @@
 import os
 import io
-import hmac
+import csv
 import json
+import hmac
 import time
-import math
 import hashlib
 import logging
-import urllib.parse
-import csv
-from datetime import datetime, timezone
-from typing import Dict, Any, Tuple, Optional, List
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import datetime as dt
+from typing import Any, Dict, List, Optional, Tuple
 
-import azure.functions as func
 import requests
+import azure.functions as func
+from azure.storage.blob import BlobServiceClient, ContentSettings
+from azure.core.exceptions import ResourceNotFoundError
+from azure.storage.blob import BlobType
 
-# ====================== ENV ======================
+# -----------------------
+# Logování
+# -----------------------
+logger = logging.getLogger("trade-func")
+logger.setLevel(logging.INFO)
 
-def _get_env(name: str, default: Optional[str] = None, required: bool = False) -> str:
-    v = os.getenv(name, default)
-    if required and (v is None or str(v).strip() == ""):
-        raise RuntimeError(f"Missing env var: {name}")
-    return v
-
-def _get_float(name: str, default: float) -> float:
-    try:
-        return float(os.getenv(name, str(default)))
-    except:
-        return default
-
-def _get_int(name: str, default: int) -> int:
-    try:
-        return int(os.getenv(name, str(default)))
-    except:
-        return default
-
-def _get_bool(name: str, default: bool) -> bool:
-    raw = os.getenv(name, "")
-    if raw == "":
-        return default
-    return str(raw).lower() in ("1", "true", "yes", "y", "on")
-
-# Azure Storage
-WEBJOBS_CONN         = _get_env("AzureWebJobsStorage", required=True)
-MODELS_CONTAINER     = _get_env("MODELS_CONTAINER", "models-recalc")
-MASTER_CSV_NAME      = _get_env("MASTER_CSV_NAME", "bs_levels_master.csv")
-STATE_CONTAINER      = _get_env("STATE_CONTAINER", "bot-state")
-TRADE_LOGS_CONTAINER = _get_env("TRADE_LOGS_CONTAINER", "trade-logs")
-
-# Trading – výběr signálů
-TRADE_PAIRS_MODELS   = _get_env("TRADE_PAIRS_MODELS", "XRPUSDT:BS_MedianScore")
-MIN_CYCLES_PER_DAY   = _get_int("MIN_CYCLES_PER_DAY", 1)
-MIN_SCORE            = _get_float("MIN_SCORE", 0.0)
-
-# Objednávky
-ORDER_USDT           = _get_float("ORDER_USDT", 10.0)  # Market BUY utratí přesně tuto částku (quoteOrderQty)
-
-# Binance API
-BINANCE_API_KEY      = _get_env("BINANCE_API_KEY", required=True)
-BINANCE_API_SECRET   = _get_env("BINANCE_API_SECRET", required=True)
-USE_TESTNET          = (_get_env("BINANCE_TESTNET", "true").lower() in ("1", "true", "yes"))
-RECV_WINDOW          = _get_int("BINANCE_RECV_WINDOW", 5000)
-TIMEOUT_S            = _get_int("BINANCE_HTTP_TIMEOUT", 15)
-
-# výkon
-PRICE_FETCH_WORKERS  = _get_int("PRICE_FETCH_WORKERS", 10)   # paralelní vlákna pro ticker/price
-API_CSV_LOGGING      = _get_bool("API_CSV_LOGGING", True)    # vypnout na produkci lze nastavením 0/false
-
+# -----------------------
+# ENV
+# -----------------------
+USE_TESTNET = os.getenv("BINANCE_TESTNET", "false").strip().lower() in ("1", "true", "yes")
 BASE_URL = "https://testnet.binance.vision" if USE_TESTNET else "https://api.binance.com"
+API_KEY = os.getenv("BINANCE_API_KEY", "").strip()
+API_SECRET = os.getenv("BINANCE_API_SECRET", "").strip().encode("utf-8")
+TIMEOUT_S = float(os.getenv("HTTP_TIMEOUT_S", "20"))
+RECV_WINDOW = int(os.getenv("RECV_WINDOW_MS", "5000"))
 
-logger = logging.getLogger("BinanceTradeBot")
-if not logger.handlers:
-    logging.basicConfig(level=logging.INFO)
+TRADE_PAIRS_MODELS = os.getenv("TRADE_PAIRS_MODELS", "").strip()  # např. "AVAXUSDC:BS_WeightedUtility"
+ORDER_QUOTE = float(os.getenv("ORDER_QUOTE", "10"))               # kolik quote (USDC/USDT) utratit při BUY
+MIN_SCORE = float(os.getenv("MIN_SCORE", "0"))
+MIN_CYCLES_PER_DAY = float(os.getenv("MIN_CYCLES_PER_DAY", "1"))
+SAFE_MODE = os.getenv("SAFE_MODE", "false").strip().lower() in ("1", "true", "yes")
 
-# ====================== Azure Blob helpers ======================
+AZ_CONN_STR = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "")
+STATE_CONTAINER = os.getenv("STATE_CONTAINER", "bot-state")
+LOGS_CONTAINER = os.getenv("LOGS_CONTAINER", "trade-logs")
+SIGNALS_CONTAINER = os.getenv("SIGNALS_CONTAINER", "signals")
+SIGNALS_BLOB = os.getenv("SIGNALS_BLOB", "bs_levels_master.csv")
 
-def _make_blob_clients():
-    from azure.storage.blob import BlobServiceClient
-    from azure.core.exceptions import ResourceExistsError
-    bs = BlobServiceClient.from_connection_string(WEBJOBS_CONN)
-    models_cc = bs.get_container_client(MODELS_CONTAINER)
-    state_cc  = bs.get_container_client(STATE_CONTAINER)
-    logs_cc   = bs.get_container_client(TRADE_LOGS_CONTAINER)
-    for cc in (models_cc, state_cc, logs_cc):
-        try:
-            cc.create_container()
-        except ResourceExistsError:
-            pass
-    return bs, models_cc, state_cc, logs_cc
+API_CSV_LOGGING = os.getenv("API_CSV_LOGGING", "false").strip().lower() in ("1", "true", "yes")
 
-def _read_blob_json(cc, name: str) -> Optional[Dict[str, Any]]:
-    from azure.core.exceptions import ResourceNotFoundError
+# -----------------------
+# Globální stav
+# -----------------------
+_SERVER_TIME_OFFSET_MS = 0
+
+# -----------------------
+# Pomocné funkce
+# -----------------------
+def _headers() -> Dict[str, str]:
+    return {
+        "X-MBX-APIKEY": API_KEY,
+        "Accept": "application/json",
+        "User-Agent": "functions-trader/1.0",
+    }
+
+def _sign(qs: str) -> str:
+    return hmac.new(API_SECRET, qs.encode("utf-8"), hashlib.sha256).hexdigest()
+
+def _ts() -> int:
+    return int(time.time() * 1000 + _SERVER_TIME_OFFSET_MS)
+
+def _timestamp() -> str:
+    return dt.datetime.utcnow().isoformat() + "Z"
+
+def _parse_pairs_models(spec: str) -> List[Tuple[str, str]]:
+    out: List[Tuple[str, str]] = []
+    if not spec:
+        return out
+    for part in spec.split(";"):
+        part = part.strip()
+        if not part or ":" not in part:
+            continue
+        sym, model = part.split(":", 1)
+        out.append((sym.strip().upper(), model.strip()))
+    return out
+
+def _egress_ip_info():
+    import urllib.request
     try:
-        data = cc.get_blob_client(name).download_blob().readall()
-        return json.loads(data.decode("utf-8"))
-    except ResourceNotFoundError:
-        return None
-    except Exception:
-        logger.exception("[blob] failed to read JSON: %s", name)
-        return None
+        with urllib.request.urlopen("https://api.ipify.org", timeout=5) as r:
+            ip = r.read().decode()
+            logger.info("Egress public IP detected as %s", ip)
+    except Exception as e:
+        logger.warning("Failed to detect egress IP: %s", e)
 
-def _write_blob_json(cc, name: str, obj: Dict[str, Any]) -> None:
-    cc.get_blob_client(name).upload_blob(
-        json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
-        overwrite=True
+def _append_api_csv(logs_cc, *, method: str, path: str, params: Dict[str, Any], status: Any, error: Optional[str], resp_text: str):
+    if not API_CSV_LOGGING:
+        return
+    try:
+        name = dt.datetime.utcnow().strftime("logs/%Y_%m_%d/api.csv")
+        bc = logs_cc.get_blob_client(name)
+        header = "ts,method,path,params,status,error,resp_text\n"
+        line = f'{_timestamp()},{method},{path},"{json.dumps(params, ensure_ascii=False)}",{status or ""},"{(error or "").replace(",", " ").replace("\n"," ")}","{(resp_text or "").replace(",", " ").replace("\n", " ")[:1000]}"\n'
+        try:
+            bc.get_blob_properties()
+        except Exception:
+            bc.upload_blob(header.encode("utf-8"), overwrite=True, content_settings=ContentSettings(content_type="text/csv"))
+        bc.append_block(line.encode("utf-8"))
+    except Exception as e:
+        logger.debug("API csv log failed: %s", e)
+
+def api_get(session: requests.Session, path: str, params: Dict[str, Any], *, logs_cc=None) -> Any:
+    url = f"{BASE_URL}{path}"
+    attempts, backoff = 4, 0.5
+    for i in range(attempts):
+        try:
+            r = session.get(url, params=params, headers=_headers(), timeout=TIMEOUT_S)
+            status = r.status_code
+            txt = r.text[:800] if isinstance(r.text, str) else ""
+            r.raise_for_status()
+            j = r.json()
+            _append_api_csv(logs_cc, method="GET", path=path, params=params, status=status, error=None, resp_text=txt)
+            return j
+        except Exception as e:
+            status = getattr(getattr(e, "response", None), "status_code", "")
+            if status in (418, 429, 500, 503) and i < attempts - 1:
+                time.sleep(backoff); backoff *= 2
+                continue
+            txt = ""
+            try:
+                txt = e.response.text[:800] if getattr(e, "response", None) is not None else ""
+            except Exception:
+                pass
+            _append_api_csv(logs_cc, method="GET", path=path, params=params, status=status, error=str(e), resp_text=txt)
+            raise
+
+def _signed_url(path: str, params: Dict[str, Any]) -> str:
+    q = "&".join([f"{k}={params[k]}" for k in sorted(params.keys())]) if params else ""
+    if q:
+        q += "&"
+    q += f"timestamp={_ts()}&recvWindow={RECV_WINDOW}"
+    sig = _sign(q)
+    return f"{BASE_URL}{path}?{q}&signature={sig}"
+
+def api_signed_get(session: requests.Session, path: str, params: Dict[str, Any], *, logs_cc=None) -> Any:
+    url = _signed_url(path, params)
+    attempts, backoff = 4, 0.5
+    for i in range(attempts):
+        try:
+            r = session.get(url, headers=_headers(), timeout=TIMEOUT_S)
+            status = r.status_code
+            txt = r.text[:800] if isinstance(r.text, str) else ""
+            r.raise_for_status()
+            j = r.json()
+            _append_api_csv(logs_cc, method="SIGNED_GET", path=path, params=params, status=status, error=None, resp_text=txt)
+            return j
+        except Exception as e:
+            status = getattr(getattr(e, "response", None), "status_code", "")
+            if status in (418, 429, 500, 503) and i < attempts - 1:
+                time.sleep(backoff); backoff *= 2
+                continue
+            txt = ""
+            try:
+                txt = e.response.text[:800] if getattr(e, "response", None) is not None else ""
+            except Exception:
+                pass
+            _append_api_csv(logs_cc, method="SIGNED_GET", path=path, params=params, status=status, error=str(e), resp_text=txt)
+            raise
+
+def api_signed_post(session: requests.Session, path: str, params: Dict[str, Any], *, logs_cc=None) -> Any:
+    url = _signed_url(path, params)
+    attempts, backoff = 4, 0.5
+    for i in range(attempts):
+        try:
+            r = session.post(url, headers=_headers(), timeout=TIMEOUT_S)
+            status = r.status_code
+            txt = r.text[:800] if isinstance(r.text, str) else ""
+            r.raise_for_status()
+            j = r.json()
+            _append_api_csv(logs_cc, method="SIGNED_POST", path=path, params=params, status=status, error=None, resp_text=txt)
+            return j
+        except Exception as e:
+            status = getattr(getattr(e, "response", None), "status_code", "")
+            if status in (418, 429, 500, 503) and i < attempts - 1:
+                time.sleep(backoff); backoff *= 2
+                continue
+            txt = ""
+            try:
+                txt = e.response.text[:800] if getattr(e, "response", None) is not None else ""
+            except Exception:
+                pass
+            _append_api_csv(logs_cc, method="SIGNED_POST", path=path, params=params, status=status, error=str(e), resp_text=txt)
+            raise
+
+def _sync_server_time(session: requests.Session, logs_cc=None):
+    global _SERVER_TIME_OFFSET_MS
+    try:
+        j = api_get(session, "/api/v3/time", {}, logs_cc=logs_cc)
+        srv = int(j.get("serverTime", 0))
+        loc = int(time.time() * 1000)
+        _SERVER_TIME_OFFSET_MS = srv - loc
+        logger.info("Server time offset set to %d ms", _SERVER_TIME_OFFSET_MS)
+    except Exception as e:
+        logger.warning("Failed to sync server time: %s", e)
+
+# -----------------------
+# Exchange info
+# -----------------------
+def _fetch_exchange_info(session: requests.Session, logs_cc, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
+    j = api_get(session, "/api/v3/exchangeInfo", {"symbols": json.dumps(symbols)}, logs_cc=logs_cc)
+    out = {}
+    for s in j.get("symbols", []):
+        if s.get("status") != "TRADING":
+            continue
+        sym = s["symbol"]
+        tick_size = step_size = min_notional = min_qty = None
+        for f in s.get("filters", []):
+            t = f.get("filterType")
+            if t == "PRICE_FILTER":
+                tick_size = float(f.get("tickSize"))
+            elif t == "LOT_SIZE":
+                step_size = float(f.get("stepSize"))
+                min_qty = float(f.get("minQty"))
+            elif t in ("MIN_NOTIONAL", "NOTIONAL"):
+                min_notional = float(f.get("minNotional"))
+        out[sym] = {
+            "base": s.get("baseAsset"),
+            "quote": s.get("quoteAsset"),
+            "tickSize": tick_size or 0.0,
+            "stepSize": step_size or 0.0,
+            "minQty": min_qty or 0.0,
+            "minNotional": min_notional or 0.0,
+        }
+    return out
+
+# -----------------------
+# Prices
+# -----------------------
+def _fetch_prices_bulk(session: requests.Session, logs_cc, pairs: List[str]) -> Dict[str, float]:
+    try:
+        data = api_get(session, "/api/v3/ticker/price", {}, logs_cc=logs_cc)
+        allp = {str(d["symbol"]).upper(): float(d["price"]) for d in data}
+        return {p: allp[p] for p in pairs if p in allp}
+    except Exception as e:
+        logger.warning("Bulk price fetch failed: %s", e)
+        out = {}
+        for p in pairs:
+            j = api_get(session, "/api/v3/ticker/price", {"symbol": p}, logs_cc=logs_cc)
+            out[p] = float(j["price"])
+        return out
+
+# -----------------------
+# Storage
+# -----------------------
+def _blob_clients():
+    bsc = BlobServiceClient.from_connection_string(AZ_CONN_STR)
+    return (
+        bsc.get_container_client(STATE_CONTAINER),
+        bsc.get_container_client(LOGS_CONTAINER),
+        bsc.get_container_client(SIGNALS_CONTAINER),
     )
 
-# ====================== TRADE CSV (AppendBlob: atomický append + hlavička) ======================
+def _ensure_container(cc):
+    try:
+        cc.create_container()
+    except Exception:
+        pass
 
 def _trade_log_blob_name(pair: str) -> str:
-    return f"{pair}.csv"
+    # sjednocený path pro trade CSV
+    return f"trades/{pair}.csv"
 
-_TRADE_HEADER = "time_utc,pair,model,side,executedQty,avgFillPrice,cummulativeQuoteQty,fee_total,fee_asset,orderId,b_level,s_level,b_signal_date\n"
+_TRADE_HEADER = "ts,pair,model,side,qty,avg_price,quote_qty,fee,fee_asset,order_id,B,S,signal_date\n"
 
 def _ensure_trade_log_append_blob_with_header(logs_cc, blob_name: str):
-    """
-    Zajistí, že trade log pro daný pár je Append Blob s hlavičkou na prvním řádku.
-    Jednorázově opraví staré soubory bez hlavičky nebo jiné blob typy.
-    """
-    from azure.core.exceptions import ResourceNotFoundError
-    from azure.storage.blob import BlobType
-
-    blob_name = _trade_log_blob_name(pair)
     bc = logs_cc.get_blob_client(blob_name)
     header_b = _TRADE_HEADER.encode("utf-8")
-
-    def _to_chunks(b: bytes, chunk: int = 4 * 1024 * 1024):
-        for i in range(0, len(b), chunk):
-            yield b[i:i+chunk]
-
     try:
         props = bc.get_blob_properties()
-        blob_type = getattr(props, "blob_type", None)
-        size = int(getattr(props, "size", 0) or 0)
-
-        if blob_type == BlobType.AppendBlob:
-            if size == 0:
-                bc.append_block(header_b)
-                return
-            head = b""
-            try:
-                head = bc.download_blob(offset=0, length=max(len(header_b), 1024)).readall()
-            except Exception:
-                head = b""
-            if head.decode("utf-8", errors="ignore").startswith(_TRADE_HEADER):
-                return
-            content = bc.download_blob().readall()
+        if props.blob_type != BlobType.AppendBlob:
+            data = bc.download_blob().readall()
             bc.delete_blob()
             bc.create_append_blob()
-            bc.append_block(header_b)
-            for chunk in _to_chunks(content):
-                if chunk:
-                    bc.append_block(chunk)
-            return
-
-        # jiný blob typ → převedeme
-        content = b""
-        try:
-            if size > 0:
-                content = bc.download_blob().readall()
-        except Exception:
-            content = b""
-        has_header = content.decode("utf-8", errors="ignore").startswith(_TRADE_HEADER)
-
-        bc.delete_blob()
-        bc.create_append_blob()
-        if not has_header:
-            bc.append_block(header_b)
-        for chunk in _to_chunks(content):
-            if chunk:
-                bc.append_block(chunk)
-
+            # vložit hlavičku, pokud v původním souboru chyběla
+            if not data or not data.startswith(header_b):
+                bc.append_block(header_b)
+            if data:
+                bc.append_block(data)
+        else:
+            # ověř hlavičku
+            try:
+                first = bc.download_blob(offset=0, length=len(header_b)).readall()
+            except Exception:
+                first = b""
+            if not first or not first.decode("utf-8", errors="ignore").startswith("ts,"):
+                tmp = bc.download_blob().readall()
+                bc.delete_blob()
+                bc.create_append_blob()
+                bc.append_block(header_b)
+                if tmp:
+                    bc.append_block(tmp)
     except ResourceNotFoundError:
         bc.create_append_blob()
         bc.append_block(header_b)
 
 def _append_trade_line(logs_cc, blob_name: str, line: str):
-    pair = blob_name.replace(".csv", "")
-    _ensure_trade_log_append_blob_with_header(logs_cc, blob_name)
-    bc = logs_cc.get_blob_client(blob_name)
-    bc.append_block(line.encode("utf-8"))
-
-# ====================== API log (AppendBlob: denní rotace + atomický append + hlavička) ======================
-
-API_LOG_COLUMNS = ["ts","method","path","params","status","error","resp_sample"]
-
-def _api_log_blob_name() -> str:
-    # Hodinová rotace: api_calls_YYYY_MM_DD_HH.csv (UTC)
-    datehour = datetime.now(timezone.utc).strftime("%Y_%m_%d_%H")
-    date = datetime.now(timezone.utc).strftime("%Y_%m_%d")
-    return f"logs/{date}/api_calls_{datehour}.csv"
-
-def _csv_line(values: List[Any]) -> str:
-    sio = io.StringIO()
-    csv.writer(sio, lineterminator="\n").writerow(values)
-    return sio.getvalue()
-
-def _ensure_api_log_append_blob_with_header(logs_cc):
-    """
-    Zajistí, že denní api_calls_YYYY_MM_DD.csv je Append Blob s hlavičkou na prvním řádku.
-    Jednorázově opraví staré soubory bez hlavičky nebo jiné blob typy.
-    """
-    from azure.core.exceptions import ResourceNotFoundError
-    from azure.storage.blob import BlobType
-
-    blob_name = _api_log_blob_name()
-    bc = logs_cc.get_blob_client(blob_name)
-    header = _csv_line(API_LOG_COLUMNS).encode("utf-8")
-
-    def _to_chunks(b: bytes, chunk: int = 4 * 1024 * 1024):
-        for i in range(0, len(b), chunk):
-            yield b[i:i+chunk]
-
     try:
-        props = bc.get_blob_properties()
-        blob_type = getattr(props, "blob_type", None)
-        size = int(getattr(props, "size", 0) or 0)
+        _ensure_trade_log_append_blob_with_header(logs_cc, blob_name)
+        bc = logs_cc.get_blob_client(blob_name)
+        bc.append_block(line.encode("utf-8"))
+    except Exception as e:
+        logger.warning("Trade CSV append failed for %s: %s", blob_name, e)
 
-        if blob_type == BlobType.AppendBlob:
-            if size == 0:
-                bc.append_block(header)
-                return
-            head = b""
-            try:
-                head = bc.download_blob(offset=0, length=max(len(header), 1024)).readall()
-            except Exception:
-                head = b""
-            if head.decode("utf-8", errors="ignore").startswith(header.decode("utf-8")):
-                return
-            content = bc.download_blob().readall()
-            bc.delete_blob()
-            bc.create_append_blob()
-            bc.append_block(header)
-            for chunk in _to_chunks(content):
-                if chunk:
-                    bc.append_block(chunk)
-            return
+def _write_blob_json(state_cc, name: str, obj: Dict[str, Any]):
+    bc = state_cc.get_blob_client(name)
+    data = (json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+    bc.upload_blob(data, overwrite=True, content_settings=ContentSettings(content_type="application/json"))
 
-        # jiný blob typ → převedeme
-        content = b""
-        try:
-            if size > 0:
-                content = bc.download_blob().readall()
-        except Exception:
-            content = b""
-        has_header = content.decode("utf-8", errors="ignore").startswith(header.decode("utf-8"))
-
-        bc.delete_blob()
-        bc.create_append_blob()
-        if not has_header:
-            bc.append_block(header)
-        for chunk in _to_chunks(content):
-            if chunk:
-                bc.append_block(chunk)
-
-    except ResourceNotFoundError:
-        bc.create_append_blob()
-        bc.append_block(header)
-
-def _append_api_csv_row(logs_cc, row_values: List[Any]):
-    _ensure_api_log_append_blob_with_header(logs_cc)
-    line = _csv_line(row_values).encode("utf-8")
-    bc = logs_cc.get_blob_client(_api_log_blob_name())
-    bc.append_block(line)
-
-def _sanitize_params(p: Dict[str, Any]) -> Dict[str, Any]:
-    if not isinstance(p, dict):
-        return {}
-    cleaned = dict(p)
-    cleaned.pop("signature", None)
-    return cleaned
-
-def _append_api_csv(logs_cc, *, method: str, path: str, params: Dict[str, Any], status: Any, error: Optional[str], resp_text: Optional[str]):
-    if not API_CSV_LOGGING:
-        return
-    par = _sanitize_params(params or {})
-    params_ser = json.dumps(par, ensure_ascii=False, separators=(",", ":"))
-
-    sample = (resp_text or "")
-    if isinstance(sample, str) and len(sample) > 1000:
-        sample = sample[:1000] + "..."
-    sample = sample.replace("\r", " ").replace("\n", " ")
-
-    row = [
-        datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        method,
-        path,
-        params_ser,
-        str(status or ""),
-        (error or ""),
-        sample,
-    ]
-    _append_api_csv_row(logs_cc, row)
-
-# ====================== Master CSV loader (1× za tik) ======================
-
-def _parse_pairs_models(val: str) -> List[Tuple[str, str]]:
-    out = []
-    for piece in val.split(","):
-        piece = piece.strip()
-        if not piece or ":" not in piece:
-            continue
-        pair, model = piece.split(":", 1)
-        out.append((pair.strip().upper(), model.strip()))
-    return out
-
-def _load_master_signals_map(models_cc) -> Dict[Tuple[str, str], Dict[str, Any]]:
-    """
-    Načte master CSV 1×, vyfiltruje is_active a prahy (MIN_CYCLES_PER_DAY, MIN_SCORE),
-    a pro každé (pair, model) vrátí poslední řádek s B/S.
-    """
-    import pandas as pd
-    from azure.core.exceptions import ResourceNotFoundError
-
-    blob = models_cc.get_blob_client(MASTER_CSV_NAME)
+def _read_blob_text(cc, name: str) -> Optional[str]:
+    bc = cc.get_blob_client(name)
     try:
-        raw = blob.download_blob().readall()
-    except ResourceNotFoundError:
-        logger.error("Master CSV not found.")
-        return {}
+        return bc.download_blob().readall().decode("utf-8")
+    except Exception:
+        return None
 
-    df = pd.read_csv(io.BytesIO(raw))
-    required = {"pair", "model", "B", "S", "date", "load_time_utc", "is_active", "score"}
-    if not required.issubset(df.columns):
-        logger.error("Master CSV missing columns, have: %s", df.columns.tolist())
-        return {}
-
-    cycles_col = "cycles" if "cycles" in df.columns else ("total_cycles" if "total_cycles" in df.columns else None)
-    if cycles_col is None:
-        logger.error("Master CSV musí obsahovat 'cycles' nebo 'total_cycles'.")
-        return {}
-
-    df["pair"] = df["pair"].astype(str).str.upper()
-    df["model"] = df["model"].astype(str)
-
-    df = df[(df["is_active"] == True) &
-            (df[cycles_col] >= MIN_CYCLES_PER_DAY) &
-            (df["score"] >= MIN_SCORE)].copy()
-    if df.empty:
-        return {}
-
-    df["load_time_utc"] = pd.to_datetime(df["load_time_utc"], errors="coerce", utc=True)
-
-    df = df.sort_values(["pair", "model", "date", "load_time_utc"])
-    latest = df.groupby(["pair", "model"], as_index=False).tail(1)
-
-    out: Dict[Tuple[str, str], Dict[str, Any]] = {}
-    for _, r in latest.iterrows():
-        key = (str(r["pair"]).upper(), str(r["model"]))
-        out[key] = {
-            "pair": key[0],
-            "model": key[1],
-            "B": float(r["B"]),
-            "S": float(r["S"]),
-            "date": str(r["date"]),
-            "load_time_utc": (r["load_time_utc"].strftime("%Y-%m-%dT%H:%M:%SZ") if not pd.isna(r["load_time_utc"]) else None),
-            "cycles": float(r[cycles_col]),
-            "score": float(r["score"]),
-        }
-    return out
-
-# ====================== Binance REST helpers (Session + CSV log) ======================
-def _get_price_with_retry(session: requests.Session, symbol: str, *, logs_cc=None, attempts: int = 2, delay: float = 0.3) -> float:
-    last_exc = None
-    for _ in range(max(1, attempts)):
+# -----------------------
+# Signals
+# -----------------------
+def _load_signals(signals_cc) -> List[Dict[str, Any]]:
+    txt = _read_blob_text(signals_cc, SIGNALS_BLOB)
+    if not txt:
+        logger.warning("Signals CSV not found: %s/%s", SIGNALS_CONTAINER, SIGNALS_BLOB)
+        return []
+    out: List[Dict[str, Any]] = []
+    rdr = csv.DictReader(io.StringIO(txt))
+    for row in rdr:
         try:
-            return get_price(session, symbol, logs_cc=logs_cc)
+            row = {k.strip(): (v.strip() if isinstance(v, str) else v) for k, v in row.items()}
+            row["pair"] = row.get("pair", "").upper()
+            row["model"] = row.get("model", "")
+            row["is_active"] = str(row.get("is_active", "true")).lower() in ("1", "true", "yes")
+            row["score"] = float(row.get("score", "0") or 0)
+            row["cycles"] = float(row.get("cycles", row.get("total_cycles", "0")) or 0)
+            row["B"] = float(row.get("B") or row.get("b") or 0)
+            row["S"] = float(row.get("S") or row.get("s") or 0)
+            out.append(row)
         except Exception as e:
-            last_exc = e
-            try: time.sleep(delay)
-            except Exception: pass
-    raise last_exc
-    
-def _sign(query: str) -> str:
-    return hmac.new(BINANCE_API_SECRET.encode("utf-8"), query.encode("utf-8"), hashlib.sha256).hexdigest()
+            logger.warning("Bad signals row skipped: %s (%s)", row, e)
+    return out
 
-def _ts() -> int:
-    return int(time.time() * 1000)
-
-def _headers() -> Dict[str, str]:
-    return {"X-MBX-APIKEY": BINANCE_API_KEY}
-
-def api_get(session: requests.Session, path: str, params: Dict[str, Any], *, logs_cc=None) -> Any:
-    url = f"{BASE_URL}{path}"
+def _select_signal(sig_rows: List[Dict[str, Any]], pair: str, model: str) -> Optional[Dict[str, Any]]:
+    cand = [r for r in sig_rows if r.get("pair") == pair and r.get("model") == model and r.get("is_active")]
+    cand = [r for r in cand if r.get("score", 0) >= MIN_SCORE and r.get("cycles", 0) >= MIN_CYCLES_PER_DAY]
+    if not cand:
+        return None
     try:
-        r = session.get(url, params=params, headers=_headers(), timeout=TIMEOUT_S)
-        status = r.status_code
-        text_sample = r.text[:800] if isinstance(r.text, str) else ""
-        r.raise_for_status()
-        j = r.json()
-        _append_api_csv(logs_cc, method="GET", path=path, params=params, status=status, error=None, resp_text=text_sample)
-        return j
-    except Exception as e:
-        status = getattr(getattr(e, "response", None), "status_code", "")
-        text = ""
-        try:
-            text = e.response.text[:800] if getattr(e, "response", None) is not None else ""
-        except Exception:
-            text = ""
-        _append_api_csv(logs_cc, method="GET", path=path, params=params, status=status, error=str(e), resp_text=text)
-        raise
+        cand.sort(key=lambda r: r.get("date", ""))
+    except Exception:
+        pass
+    return cand[-1]
 
-def api_signed_post(session: requests.Session, path: str, params: Dict[str, Any], *, logs_cc=None) -> Any:
-    p = dict(params)
-    p["timestamp"] = _ts()
-    p["recvWindow"] = RECV_WINDOW
-    qs = urllib.parse.urlencode(p, doseq=True)
-    sig = _sign(qs)
-    url = f"{BASE_URL}{path}?{qs}&signature={sig}"
-    try:
-        r = session.post(url, headers=_headers(), timeout=TIMEOUT_S)
-        status = r.status_code
-        text_sample = r.text[:800] if isinstance(r.text, str) else ""
-        r.raise_for_status()
-        j = r.json()
-        _append_api_csv(logs_cc, method="POST", path=path, params=_sanitize_params(p), status=status, error=None, resp_text=text_sample)
-        return j
-    except Exception as e:
-        status = getattr(getattr(e, "response", None), "status_code", "")
-        text = ""
-        try:
-            text = e.response.text[:800] if getattr(e, "response", None) is not None else ""
-        except Exception:
-            text = ""
-        _append_api_csv(logs_cc, method="POST", path=path, params=_sanitize_params(p), status=status, error=str(e), resp_text=text)
-        raise
+# -----------------------
+# Account helpers
+# -----------------------
+def _get_free_asset(session: requests.Session, logs_cc, asset: str) -> float:
+    acct = api_signed_get(session, "/api/v3/account", {}, logs_cc=logs_cc)
+    for b in acct.get("balances", []):
+        if b.get("asset") == asset:
+            try:
+                return float(b.get("free", "0"))
+            except Exception:
+                return 0.0
+    return 0.0
 
-def get_price(session: requests.Session, symbol: str, *, logs_cc=None) -> float:
-    j = api_get(session, "/api/v3/ticker/price", {"symbol": symbol}, logs_cc=logs_cc)
-    return float(j["price"])
-
-# ====================== exchangeInfo cache (1× denně) ======================
-
-def _pairs_only(val: str) -> List[str]:
-    out = []
-    for piece in val.split(","):
-        piece = piece.strip()
-        if not piece or ":" not in piece:
-            continue
-        pair, _ = piece.split(":", 1)
-        out.append(pair.strip().upper())
-    # dedup
-    seen = set(); res = []
-    for p in out:
-        if p not in seen:
-            seen.add(p); res.append(p)
-    return res
-
-def _exchangeinfo_blob_name_for_today() -> str:
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    return f"exchangeinfo_{today}.json"
-
-def _ensure_exchangeinfo_json_for_today(session: requests.Session, logs_cc, pairs: List[str]) -> Dict[str, Any]:
-    blob_name = _exchangeinfo_blob_name_for_today()
-    cached = _read_blob_json(logs_cc, blob_name)
-    if cached and isinstance(cached, dict) and cached.get("asof_date"):
-        logger.info("[exchangeInfo] using cached %s", blob_name)
-        return cached
-
-    symbols_param = json.dumps(pairs, separators=(",", ":"))
-    info = api_get(session, "/api/v3/exchangeInfo", {"symbols": symbols_param}, logs_cc=logs_cc)
-
-    filt_map: Dict[str, Any] = {}
-    for sym in info.get("symbols", []):
-        sname = sym.get("symbol")
-        status = sym.get("status")
-        tick_size = None
-        step_size = None
-        min_notional = None
-        for f in sym.get("filters", []):
-            ftype = f.get("filterType")
-            if ftype == "PRICE_FILTER":
-                try: tick_size = float(f.get("tickSize"))
-                except: tick_size = None
-            elif ftype == "LOT_SIZE":
-                try: step_size = float(f.get("stepSize"))
-                except: step_size = None
-            elif ftype == "MIN_NOTIONAL":
-                try: min_notional = float(f.get("minNotional", "0") or 0)
-                except: min_notional = None
-        if sname:
-            filt_map[sname.upper()] = {
-                "status": status,
-                "tickSize": tick_size or 0.0,
-                "stepSize": step_size or 0.0,
-                "minNotional": min_notional or 0.0
-            }
-
-    payload = {
-        "asof_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-        "filters": filt_map
-    }
-    _write_blob_json(logs_cc, blob_name, payload)
-    logger.info("[exchangeInfo] cached to %s (%d symbols)", blob_name, len(filt_map))
-    return payload
-
-def get_symbol_filters_cached(filters_json: Dict[str, Any], symbol: str) -> Tuple[float, float, float, str]:
-    entry = (filters_json.get("filters") or {}).get(symbol.upper())
-    if not entry:
-        return (0.0, 0.0, 0.0, "UNKNOWN")
-    return (
-        float(entry.get("stepSize", 0.0)),
-        float(entry.get("minNotional", 0.0)),
-        float(entry.get("tickSize", 0.0)),
-        str(entry.get("status", "TRADING") or "TRADING")
-    )
-
-def round_down_qty(qty: float, step: float) -> float:
-    if step <= 0:
-        return qty
-    return math.floor(qty / step) * step
-
-# ====================== Orders ======================
-
-def place_market_buy_quote(session: requests.Session, symbol: str, quote_usdt: float, *, logs_cc=None) -> Dict[str, Any]:
+# -----------------------
+# Objednávky (MARKET)
+# -----------------------
+def place_market_buy_quote(session: requests.Session, symbol: str, quote_qty: float, *, logs_cc=None) -> Dict[str, Any]:
     params = {
         "symbol": symbol,
         "side": "BUY",
         "type": "MARKET",
-        "quoteOrderQty": f"{quote_usdt:.8f}",
-        "newOrderRespType": "FULL"
+        "quoteOrderQty": f"{quote_qty:.8f}",
+        "newOrderRespType": "FULL",
     }
     return api_signed_post(session, "/api/v3/order", params, logs_cc=logs_cc)
 
-def place_market_sell_qty(session: requests.Session, symbol: str, qty: float, *, logs_cc=None) -> Dict[str, Any]:
+def place_market_sell_base(session: requests.Session, symbol: str, qty: float, *, logs_cc=None) -> Dict[str, Any]:
     params = {
         "symbol": symbol,
         "side": "SELL",
         "type": "MARKET",
         "quantity": f"{qty:.8f}",
-        "newOrderRespType": "FULL"
+        "newOrderRespType": "FULL",
     }
     return api_signed_post(session, "/api/v3/order", params, logs_cc=logs_cc)
 
-# ====================== Bot core ======================
+# -----------------------
+# Rozhodování
+# -----------------------
+def run_decision_for_pair(session: requests.Session, state_cc, logs_cc,
+                          pair: str, model: str, exf: Dict[str, Any],
+                          price: float, sig_row: Dict[str, Any]) -> None:
 
-def _state_blob_name(pair: str, model: str) -> str:
-    return f"{pair}_{model}.json"
+    s_name = f"{pair}_{model}.json"
+    st_txt = _read_blob_text(state_cc, s_name)
+    st = json.loads(st_txt) if st_txt else {"position": "flat"}
 
-def _avg_fill_price(fills: List[Dict[str,Any]]) -> float:
-    if not fills: return 0.0
-    total_qty = 0.0
-    total_quote = 0.0
-    for f in fills:
-        p = float(f["price"]); q = float(f["qty"])
-        total_qty += q
-        total_quote += p*q
-    return (total_quote / total_qty) if total_qty>0 else 0.0
+    B = float(sig_row.get("B", 0.0))
+    S = float(sig_row.get("S", 0.0))
+    base = exf.get("base", "BASE")
+    quote = exf.get("quote", "USDT")
+    step = float(exf.get("stepSize", 0.0))
+    min_qty = float(exf.get("minQty", 0.0))
+    min_not = float(exf.get("minNotional", 0.0))
 
-def _sum_fee(fills: List[Dict[str,Any]]) -> Tuple[float,str]:
-    total = 0.0
-    asset = None
-    for f in fills:
-        total += float(f["commission"])
-        asset = f.get("commissionAsset", asset)
-    return total, (asset or "USDT")
+    logger.info("[%s/%s] price=%.8f B=%.8f pos=%s", pair, model, price, B, st.get("position"))
 
-def _timestamp() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-def _fetch_prices_parallel(session: requests.Session, logs_cc, pairs: List[str]) -> Dict[str, float]:
-    """
-    Stáhne /ticker/price pro všechny páry paralelně, vrátí mapu {pair: price}.
-    """
-    prices: Dict[str,float] = {}
-    def task(pair: str):
-        return pair, get_price(session, pair, logs_cc=logs_cc)
-
-    with ThreadPoolExecutor(max_workers=max(1, PRICE_FETCH_WORKERS)) as ex:
-        futs = { ex.submit(task, p): p for p in pairs }
-        for fut in as_completed(futs):
-            p = futs[fut]
-            try:
-                sym, price = fut.result()
-                prices[sym] = price
-            except Exception as e:
-                logger.warning("[%s] price fetch failed: %s", p, e)
-    return prices
-
-def _trade_log_blob_name(pair: str) -> str:
-    return f"trades/{pair}.csv"
-
-def run_decision_for_pair(session: requests.Session,
-                          models_cc, state_cc, logs_cc,
-                          pair: str, model: str,
-                          sig_row: Optional[Dict[str,Any]],
-                          exch_cache: Dict[str,Any],
-                          current_price: Optional[float]) -> None:
-    # pokud nemáme platný signál, přeskoč
-    if not sig_row:
-        logger.info("[%s/%s] No active signal passing thresholds — skipping.", pair, model)
-        return
-
-    B = float(sig_row["B"]); S = float(sig_row["S"])
-
-    # načti stav
-    s_name = _state_blob_name(pair, model)
-    st = _read_blob_json(state_cc, s_name) or {
-        "position": "flat",
-        "qty": 0.0,
-        "entry_price": None,
-        "entry_quote": 0.0,
-        "b_level": None, "s_level": None,
-        "signal_date": None
-    }
-
-    # cena
-    if current_price is None:
+    # --- SELL (placeholder: podmínku doplň podle modelu)
+    sell_condition = False  # ponech dle své strategie
+    if st.get("position") == "long" and sell_condition:
         try:
-            current_price = _get_price_with_retry(session, pair, logs_cc=logs_cc, attempts=2, delay=0.3)
-            logger.info("[%s/%s] price retry OK: %.8f", pair, model, float(current_price))
-        except Exception as e:
-            _status = get_symbol_filters_cached(exch_cache, pair)[3]
-            logger.warning("[%s/%s] Missing current price after retry (status=%s) → skip. reason=%s",
-                           pair, model, _status, e)
-            return
-    px = float(current_price)
-
-    # filtry
-    step, min_notional, _tick, status = get_symbol_filters_cached(exch_cache, pair)
-    if status and status != "TRADING":
-        logger.info("[%s/%s] status=%s → skipping trading", pair, model, status)
-        return
-
-    # SELL
-    if st["position"] == "long" and px >= (st.get("s_level") or S):
-        qty_sell = round_down_qty(float(st["qty"]), step)
-        if qty_sell <= 0:
-            st = { "position":"flat", "qty":0.0, "entry_price":None, "entry_quote":0.0,
-                   "b_level":None, "s_level":None, "signal_date":None }
-            _write_blob_json(state_cc, s_name, st)
-            return
-
-        if min_notional and qty_sell * px < min_notional:
-            logger.info("[%s/%s] SELL under minNotional (qty=%s px=%s) → skip.",
-                        pair, model, qty_sell, px)
-            return
-
-        try:
-            odr = place_market_sell_qty(session, pair, qty_sell, logs_cc=logs_cc)
+            odr = place_market_sell_base(session, pair, float(st.get("qty", 0.0)), logs_cc=logs_cc)
         except Exception as e:
             logger.warning("[%s/%s] SELL order failed: %s", pair, model, e)
             return
 
-        executed_qty = float(odr.get("executedQty", "0"))
-        cq = float(odr.get("cummulativeQuoteQty", "0"))
+        # parse výsledků
         fills = odr.get("fills", []) or []
-        avgp = _avg_fill_price(fills)
-        fee_total, fee_asset = _sum_fee(fills)
+        executed_qty = sum(float(f.get("qty", 0)) for f in fills) if fills else float(odr.get("executedQty", 0))
+        cqq = sum(float(f.get("price", 0)) * float(f.get("qty", 0)) for f in fills) if fills else float(odr.get("cummulativeQuoteQty", 0))
+        avgp = (cqq / executed_qty) if executed_qty > 0 else price
+        fee_total = sum(float(f.get("commission", 0) or 0) for f in fills) if fills else 0.0
+        fee_asset = (fills[0].get("commissionAsset") if fills else "")
 
+        # 1) nejdřív stav
+        st = {"position": "flat"}
+        _write_blob_json(state_cc, s_name, st)
+
+        # 2) pak CSV
         line = ",".join([
             _timestamp(), pair, model, "SELL",
             f"{executed_qty:.8f}",
             f"{avgp:.8f}",
-            f"{cq:.8f}",
+            f"{cqq:.8f}",
             f"{fee_total:.8f}",
-            fee_asset,
-            str(odr.get("orderId","")),
-            f"{st.get('b_level',0.0):.8f}",
-            f"{st.get('s_level',0.0):.8f}",
-            str(st.get("signal_date") or "")
-        ]) + "\n"
-        _append_trade_line(logs_cc, _trade_log_blob_name(pair), line)
-
-        st = { "position":"flat", "qty":0.0, "entry_price":None, "entry_quote":0.0,
-               "b_level":None, "s_level":None, "signal_date":None }
-        _write_blob_json(state_cc, s_name, st)
-        logger.info("[%s/%s] SELL filled qty=%s avg=%.6f cq=%.6f", pair, model, executed_qty, avgp, cq)
-        return
-
-    # BUY
-    if st["position"] == "flat" and px <= B:
-        if min_notional and ORDER_USDT < min_notional:
-            logger.info("[%s/%s] BUY under minNotional (%.4f < %.4f) → skip",
-                        pair, model, ORDER_USDT, min_notional)
-            return
-        try:
-            odr = place_market_buy_quote(session, pair, ORDER_USDT, logs_cc=logs_cc)
-        except Exception as e:
-            logger.warning("[%s/%s] BUY order failed: %s", pair, model, e)
-            return
-
-        executed_qty = float(odr.get("executedQty","0"))
-        cq = float(odr.get("cummulativeQuoteQty","0"))
-        fills = odr.get("fills", []) or []
-        avgp = _avg_fill_price(fills)
-        fee_total, fee_asset = _sum_fee(fills)
-
-        line = ",".join([
-            _timestamp(), pair, model, "BUY",
-            f"{executed_qty:.8f}",
-            f"{avgp:.8f}",
-            f"{cq:.8f}",
-            f"{fee_total:.8f}",
-            fee_asset,
-            str(odr.get("orderId","")),
+            fee_asset or "",
+            str(odr.get("orderId", "")),
             f"{B:.8f}",
             f"{S:.8f}",
             str(sig_row.get("date") or "")
         ]) + "\n"
         _append_trade_line(logs_cc, _trade_log_blob_name(pair), line)
 
+        logger.info("[%s/%s] SELL filled qty=%.8f @ %.8f (quote=%.8f %s)", pair, model, executed_qty, avgp, cqq, quote)
+        return
+
+    # --- BUY: pouze pokud nejsme v pozici a cena <= B
+    if st.get("position") == "flat" and price <= B:
+        # minNotional guard (pokud burza vyžaduje)
+        if min_not and ORDER_QUOTE < min_not:
+            logger.info("[%s/%s] BUY under minNotional (%.4f < %.4f) → skip", pair, model, ORDER_QUOTE, min_not)
+            return
+
+        # dostupný quote zůstatek
+        free_q = _get_free_asset(session, logs_cc, quote)
+        spend = min(ORDER_QUOTE, max(0.0, free_q - 0.01))
+        if spend <= 0:
+            logger.info("[%s/%s] No BUY: free %s = %.8f", pair, model, quote, free_q)
+            return
+
+        if SAFE_MODE:
+            logger.info("[%s/%s] SAFE_MODE ON → would BUY for %.8f %s", pair, model, spend, quote)
+            return
+
+        try:
+            odr = place_market_buy_quote(session, pair, spend, logs_cc=logs_cc)
+        except Exception as e:
+            logger.warning("[%s/%s] BUY order failed: %s", pair, model, e)
+            return
+
+        fills = odr.get("fills", []) or []
+        executed_qty = sum(float(f.get("qty", 0)) for f in fills) if fills else float(odr.get("executedQty", 0))
+        cqq = sum(float(f.get("price", 0)) * float(f.get("qty", 0)) for f in fills) if fills else float(odr.get("cummulativeQuoteQty", 0))
+        avgp = (cqq / executed_qty) if executed_qty > 0 else price
+        fee_total = sum(float(f.get("commission", 0) or 0) for f in fills) if fills else 0.0
+        fee_asset = (fills[0].get("commissionAsset") if fills else "")
+
+        # množství zkontroluj vůči minQty (hlavně u stepSize)
+        est_qty = executed_qty
+        if step > 0:
+            est_qty = (int(est_qty / step)) * step
+        if min_qty and est_qty < min_qty:
+            logger.info("[%s/%s] BUY filled qty(%.8f) < minQty(%.8f) — check filters", pair, model, executed_qty, min_qty)
+
+        # 1) nejdřív uložit stav (aby případný problém s CSV nesmetl state)
         st = {
             "position": "long",
             "qty": executed_qty,
             "entry_price": avgp,
-            "entry_quote": cq,
+            "entry_quote": cqq,
             "b_level": B,
             "s_level": S,
-            "signal_date": sig_row.get("date")
+            "signal_date": sig_row.get("date"),
+            "last_update": _timestamp(),
         }
         _write_blob_json(state_cc, s_name, st)
-        logger.info("[%s/%s] BUY filled qty=%s avg=%.6f cq=%.6f", pair, model, executed_qty, avgp, cq)
+
+        # 2) pak log do CSV
+        line = ",".join([
+            _timestamp(), pair, model, "BUY",
+            f"{executed_qty:.8f}",
+            f"{avgp:.8f}",
+            f"{cqq:.8f}",
+            f"{fee_total:.8f}",
+            fee_asset or "",
+            str(odr.get("orderId", "")),
+            f"{B:.8f}",
+            f"{S:.8f}",
+            str(sig_row.get("date") or "")
+        ]) + "\n"
+        _append_trade_line(logs_cc, _trade_log_blob_name(pair), line)
+
+        logger.info("[%s/%s] BUY filled qty=%.8f @ %.8f (quote=%.8f %s)", pair, model, executed_qty, avgp, cqq, quote)
         return
 
-    logger.info("[%s/%s] No action. px=%.6f B=%.6f S=%.6f pos=%s", pair, model, px, B, S, st["position"])
+    # žádná akce
+    logger.info("[%s/%s] No action (pos=%s, px=%.8f, B=%.8f)", pair, model, st.get("position"), price, B)
 
-# ====================== Diagnostika egress IP (log) ======================
-
-def _egress_ip_info():
-    """
-    Zaloguju aktuální odchozí veřejnou IP a kontext (BASE_URL, USE_TESTNET).
-    Best-effort, neukončí běh.
-    """
-    ip = None
-    try:
-        ip = requests.get("https://api.ipify.org?format=json", timeout=5).json().get("ip")
-    except Exception as e:
-        logger.warning("ipify failed: %s", e)
-
-    if not ip:
-        try:
-            ip = requests.get("https://ifconfig.me/ip", timeout=5).text.strip()
-        except Exception as e:
-            logger.warning("ifconfig.me failed: %s", e)
-
-    try:
-        import socket, urllib.parse
-        host = urllib.parse.urlparse(BASE_URL).netloc or BASE_URL.split("://", 1)[-1]
-        addrs = sorted({ai[4][0] for ai in socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)})
-        resolved = ", ".join(addrs)
-    except Exception:
-        resolved = "n/a"
-
-    logger.info("Outbound IP=%s | BASE_URL=%s | USE_TESTNET=%s | DNS(%s)=%s",
-                ip, BASE_URL, USE_TESTNET,
-                (urllib.parse.urlparse(BASE_URL).netloc or BASE_URL), resolved)
-
-# ====================== Azure Function entry ======================
-
-def _parse_pairs_models(val: str) -> List[Tuple[str,str]]:
-    out = []
-    for piece in val.split(","):
-        piece = piece.strip()
-        if not piece or ":" not in piece: continue
-        pair, model = piece.split(":",1)
-        out.append((pair.strip().upper(), model.strip()))
-    return out
-
+# -----------------------
+# Hlavní funkce (Timer)
+# -----------------------
 def main(mytimer: func.TimerRequest) -> None:
-    try:
-        _, models_cc, state_cc, logs_cc = _make_blob_clients()
+    if not API_KEY or not API_SECRET:
+        logger.error("Missing API credentials (BINANCE_API_KEY/BINANCE_API_SECRET).")
+        return
 
-        # Zajisti denní API log soubor (AppendBlob + header)
-        _ensure_api_log_append_blob_with_header(logs_cc)
+    state_cc, logs_cc, signals_cc = _blob_clients()
+    for cc in (state_cc, logs_cc, signals_cc):
+        _ensure_container(cc)
 
-        # 0) Parsuj páry/modely + výpis pro diagnózu
-        pairs_models = _parse_pairs_models(TRADE_PAIRS_MODELS)
-        if not pairs_models:
-            logger.error("TRADE_PAIRS_MODELS is empty"); return
-        pairs = sorted({p for (p, _m) in pairs_models})
-        logger.info("Parsed %d pairs, %d pair-model combos", len(pairs), len(pairs_models))
+    session = requests.Session()
+    _egress_ip_info()
+    _sync_server_time(session, logs_cc=logs_cc)
 
-        # 1) Session reuse
-        session = requests.Session()
-        _egress_ip_info()
+    pairs_models = _parse_pairs_models(TRADE_PAIRS_MODELS)
+    if not pairs_models:
+        logger.warning("No pairs to process (TRADE_PAIRS_MODELS is empty).")
+        return
 
-        # 2) exchangeInfo cache 1× denně
-        exchangeinfo_today = _ensure_exchangeinfo_json_for_today(session, logs_cc, pairs)
+    symbols = [p for p, _ in pairs_models]
+    exinfo = _fetch_exchange_info(session, logs_cc, symbols)
+    prices = _fetch_prices_bulk(session, logs_cc, symbols)
+    sig_rows = _load_signals(signals_cc)
 
-        # 3) master CSV load 1× za tik
-        sig_map = _load_master_signals_map(models_cc)
-
-        # 4) ceny paralelně
-        prices = _fetch_prices_parallel(session, logs_cc, pairs)
-
-        # 5) rozhodnutí per pair-model (sekvenčně; ordery řešíme jednotlivě)
-        start = time.time()
-        for pair, model in pairs_models:
-            sig_row = sig_map.get((pair, model))
-            price = prices.get(pair)
-            run_decision_for_pair(session, models_cc, state_cc, logs_cc, pair, model, sig_row, exchangeinfo_today, price)
-        dur = time.time() - start
-        logger.info("Tick finished in %.2fs for %d pairs", dur, len(pairs))
-
-    except Exception:
-        logger.exception("[BinanceTradeBot] Unhandled exception in main()")
-        raise
+    for pair, model in pairs_models:
+        if pair not in exinfo:
+            logger.info("[%s/%s] Missing exchangeInfo or not TRADING → skip", pair, model)
+            continue
+        if pair not in prices:
+            logger.info("[%s/%s] Missing price → skip", pair, model)
+            continue
+        sig = _select_signal(sig_rows, pair, model)
+        if not sig:
+            logger.info("[%s/%s] No active signal passing thresholds — skip", pair, model)
+            continue
+        run_decision_for_pair(session, state_cc, logs_cc, pair, model, exinfo[pair], prices[pair], sig)
