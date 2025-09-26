@@ -109,7 +109,8 @@ def _write_blob_json(cc, name: str, obj: Dict[str, Any]) -> None:
 # ====================== TRADE CSV (AppendBlob: atomický append + hlavička) ======================
 
 def _trade_log_blob_name(pair: str) -> str:
-    return f"{pair}.csv"
+    # sjednocená cesta pro trade CSV
+    return f"trades/{pair}.csv"
 
 _TRADE_HEADER = "time_utc,pair,model,side,executedQty,avgFillPrice,cummulativeQuoteQty,fee_total,fee_asset,orderId,b_level,s_level,b_signal_date\n"
 
@@ -121,7 +122,7 @@ def _ensure_trade_log_append_blob_with_header(logs_cc, blob_name: str):
     from azure.core.exceptions import ResourceNotFoundError
     from azure.storage.blob import BlobType
 
-    blob_name = _trade_log_blob_name(pair)
+    # NEPOUŽÍVAT nezavedenou proměnnou `pair` – pracujeme s parametrem `blob_name`
     bc = logs_cc.get_blob_client(blob_name)
     header_b = _TRADE_HEADER.encode("utf-8")
 
@@ -176,10 +177,12 @@ def _ensure_trade_log_append_blob_with_header(logs_cc, blob_name: str):
         bc.append_block(header_b)
 
 def _append_trade_line(logs_cc, blob_name: str, line: str):
-    pair = blob_name.replace(".csv", "")
-    _ensure_trade_log_append_blob_with_header(logs_cc, blob_name)
-    bc = logs_cc.get_blob_client(blob_name)
-    bc.append_block(line.encode("utf-8"))
+    try:
+        _ensure_trade_log_append_blob_with_header(logs_cc, blob_name)
+        bc = logs_cc.get_blob_client(blob_name)
+        bc.append_block(line.encode("utf-8"))
+    except Exception as e:
+        logger.warning("Trade CSV append failed for %s: %s", blob_name, e)
 
 # ====================== API log (AppendBlob: denní rotace + atomický append + hlavička) ======================
 
@@ -274,22 +277,14 @@ def _sanitize_params(p: Dict[str, Any]) -> Dict[str, Any]:
 def _append_api_csv(logs_cc, *, method: str, path: str, params: Dict[str, Any], status: Any, error: Optional[str], resp_text: Optional[str]):
     if not API_CSV_LOGGING:
         return
-    par = _sanitize_params(params or {})
-    params_ser = json.dumps(par, ensure_ascii=False, separators=(",", ":"))
-
+    params_ser = json.dumps(_sanitize_params(params or {}), ensure_ascii=False, separators=(",", ":"))
     sample = (resp_text or "")
     if isinstance(sample, str) and len(sample) > 1000:
         sample = sample[:1000] + "..."
     sample = sample.replace("\r", " ").replace("\n", " ")
-
     row = [
         datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        method,
-        path,
-        params_ser,
-        str(status or ""),
-        (error or ""),
-        sample,
+        method, path, params_ser, str(status or ""), (error or ""), sample
     ]
     _append_api_csv_row(logs_cc, row)
 
@@ -578,9 +573,6 @@ def _fetch_prices_parallel(session: requests.Session, logs_cc, pairs: List[str])
                 logger.warning("[%s] price fetch failed: %s", p, e)
     return prices
 
-def _trade_log_blob_name(pair: str) -> str:
-    return f"trades/{pair}.csv"
-
 def run_decision_for_pair(session: requests.Session,
                           models_cc, state_cc, logs_cc,
                           pair: str, model: str,
@@ -649,6 +641,17 @@ def run_decision_for_pair(session: requests.Session,
         avgp = _avg_fill_price(fills)
         fee_total, fee_asset = _sum_fee(fills)
 
+        # uložit původní B/S/signal_date před přepsáním stavu
+        prev_B = st.get("b_level", 0.0)
+        prev_S = st.get("s_level", 0.0)
+        prev_sig_date = st.get("signal_date")
+
+        # 1) STATE FIRST – po fill se pozice uzavírá
+        st = { "position":"flat", "qty":0.0, "entry_price":None, "entry_quote":0.0,
+               "b_level":None, "s_level":None, "signal_date":None }
+        _write_blob_json(state_cc, s_name, st)
+
+        # 2) CSV LOG – použijeme hodnoty z původního stavu
         line = ",".join([
             _timestamp(), pair, model, "SELL",
             f"{executed_qty:.8f}",
@@ -657,15 +660,12 @@ def run_decision_for_pair(session: requests.Session,
             f"{fee_total:.8f}",
             fee_asset,
             str(odr.get("orderId","")),
-            f"{st.get('b_level',0.0):.8f}",
-            f"{st.get('s_level',0.0):.8f}",
-            str(st.get("signal_date") or "")
+            f"{float(prev_B or 0.0):.8f}",
+            f"{float(prev_S or 0.0):.8f}",
+            str(prev_sig_date or "")
         ]) + "\n"
         _append_trade_line(logs_cc, _trade_log_blob_name(pair), line)
 
-        st = { "position":"flat", "qty":0.0, "entry_price":None, "entry_quote":0.0,
-               "b_level":None, "s_level":None, "signal_date":None }
-        _write_blob_json(state_cc, s_name, st)
         logger.info("[%s/%s] SELL filled qty=%s avg=%.6f cq=%.6f", pair, model, executed_qty, avgp, cq)
         return
 
@@ -687,6 +687,19 @@ def run_decision_for_pair(session: requests.Session,
         avgp = _avg_fill_price(fills)
         fee_total, fee_asset = _sum_fee(fills)
 
+        # 1) STATE FIRST – aby případný problém s CSV nezhodil stav
+        st = {
+            "position": "long",
+            "qty": executed_qty,
+            "entry_price": avgp,
+            "entry_quote": cq,
+            "b_level": B,
+            "s_level": S,
+            "signal_date": sig_row.get("date")
+        }
+        _write_blob_json(state_cc, s_name, st)
+
+        # 2) CSV LOG
         line = ",".join([
             _timestamp(), pair, model, "BUY",
             f"{executed_qty:.8f}",
@@ -701,16 +714,6 @@ def run_decision_for_pair(session: requests.Session,
         ]) + "\n"
         _append_trade_line(logs_cc, _trade_log_blob_name(pair), line)
 
-        st = {
-            "position": "long",
-            "qty": executed_qty,
-            "entry_price": avgp,
-            "entry_quote": cq,
-            "b_level": B,
-            "s_level": S,
-            "signal_date": sig_row.get("date")
-        }
-        _write_blob_json(state_cc, s_name, st)
         logger.info("[%s/%s] BUY filled qty=%s avg=%.6f cq=%.6f", pair, model, executed_qty, avgp, cq)
         return
 
