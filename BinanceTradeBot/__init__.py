@@ -75,6 +75,9 @@ BASE_URL             = "https://testnet.binance.vision" if USE_TESTNET else "htt
 PRICE_FETCH_WORKERS  = _get_int("PRICE_FETCH_WORKERS", 10)
 API_CSV_LOGGING      = _get_bool("API_CSV_LOGGING", True)
 
+# odchozí IP cache
+OUTBOUND_IP_CACHE_TTL_S = _get_int("OUTBOUND_IP_CACHE_TTL_S", 300)
+
 # ========= DECIMAL PRECISION =========
 getcontext().prec = 28  # bezpečná přesnost pro step/ořezávání
 
@@ -83,7 +86,12 @@ def _timestamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def _headers() -> Dict[str, str]:
-    return {"X-MBX-APIKEY": BINANCE_API_KEY}
+    # standardní hlavičky (pomáhá proti 451/edge)
+    return {
+        "X-MBX-APIKEY": BINANCE_API_KEY,
+        "Accept": "application/json",
+        "User-Agent": "functions-binance-bot/1.0"
+    }
 
 def _sign(query: str) -> str:
     return hmac.new(BINANCE_API_SECRET.encode("utf-8"), query.encode("utf-8"), hashlib.sha256).hexdigest()
@@ -98,54 +106,27 @@ def _sanitize_params(p: Dict[str, Any]) -> Dict[str, Any]:
     cleaned.pop("signature", None)
     return cleaned
 
-def api_get(session: requests.Session, path: str, params: Dict[str, Any], *, logs_cc=None) -> Any:
-    url = f"{BASE_URL}{path}"
+# ========= Outbound IP (cached) =========
+_IP_CACHE = {"ip": None, "ts": 0.0}
+
+def _get_outbound_ip() -> Optional[str]:
+    """Získá aktuální veřejnou odchozí IP (s cache a TTL)."""
+    now = time.time()
+    if _IP_CACHE["ip"] and (now - _IP_CACHE["ts"] < OUTBOUND_IP_CACHE_TTL_S):
+        return _IP_CACHE["ip"]
+    ip = None
     try:
-        r = session.get(url, params=params, headers=_headers(), timeout=TIMEOUT_S)
-        status = r.status_code
-        txt = r.text[:800] if isinstance(r.text, str) else ""
-        r.raise_for_status()
-        j = r.json()
-        _append_api_csv(logs_cc, method="GET", path=path, params=params, status=status, error=None, resp_text=txt)
-        return j
-    except Exception as e:
-        status = getattr(getattr(e, "response", None), "status_code", "")
-        txt = ""
+        ip = requests.get("https://api.ipify.org?format=json", timeout=5).json().get("ip")
+    except Exception:
+        pass
+    if not ip:
         try:
-            txt = e.response.text[:800] if getattr(e, "response", None) is not None else ""
+            ip = requests.get("https://ifconfig.me/ip", timeout=5).text.strip()
         except Exception:
             pass
-        _append_api_csv(logs_cc, method="GET", path=path, params=params, status=status, error=str(e), resp_text=txt)
-        raise
-
-def api_signed_post(session: requests.Session, path: str, params: Dict[str, Any], *, logs_cc=None) -> Any:
-    p = dict(params)
-    p["timestamp"] = _ts()
-    p["recvWindow"] = RECV_WINDOW
-    qs = urllib.parse.urlencode(p, doseq=True)
-    sig = _sign(qs)
-    url = f"{BASE_URL}{path}?{qs}&signature={sig}"
-    try:
-        r = session.post(url, headers=_headers(), timeout=TIMEOUT_S)
-        status = r.status_code
-        txt = r.text[:800] if isinstance(r.text, str) else ""
-        r.raise_for_status()
-        j = r.json()
-        _append_api_csv(logs_cc, method="POST", path=path, params=_sanitize_params(p), status=status, error=None, resp_text=txt)
-        return j
-    except Exception as e:
-        status = getattr(getattr(e, "response", None), "status_code", "")
-        txt = ""
-        try:
-            txt = e.response.text[:800] if getattr(e, "response", None) is not None else ""
-        except Exception:
-            pass
-        _append_api_csv(logs_cc, method="POST", path=path, params=_sanitize_params(p), status=status, error=str(e), resp_text=txt)
-        raise
-
-def get_price(session: requests.Session, symbol: str, *, logs_cc=None) -> float:
-    j = api_get(session, "/api/v3/ticker/price", {"symbol": symbol}, logs_cc=logs_cc)
-    return float(j["price"])
+    _IP_CACHE["ip"] = ip
+    _IP_CACHE["ts"] = now
+    return ip
 
 # ========= Azure Blob =========
 def _make_blob_clients():
@@ -228,26 +209,34 @@ def _ensure_trade_log_append_blob_with_header(logs_cc, blob_name: str):
 def _append_trade_line(logs_cc, blob_name: str, line: str):
     try:
         _ensure_trade_log_append_blob_with_header(logs_cc, blob_name)
-        bc = logs_cc.get_blob_client(blob_name)
-        bc.append_block(line.encode("utf-8"))
+        logs_cc.get_blob_client(blob_name).append_block(line.encode("utf-8"))
     except Exception as e:
         logger.warning("Trade CSV append failed for %s: %s", blob_name, e)
 
-# ========= API CSV (per-hour) =========
-API_LOG_COLUMNS = ["ts","method","path","params","status","error","resp_sample"]
+# ========= API CSVs (per-hour) =========
+# Rozdělené logy: zvlášť ceny, zvlášť ostatní
+API_LOG_COLUMNS = ["ts","method","path","params","status","error","resp_sample","outbound_ip"]
 
-def _api_log_blob_name() -> str:
+def _date_parts():
     datehour = datetime.now(timezone.utc).strftime("%Y_%m_%d_%H")
     date = datetime.now(timezone.utc).strftime("%Y_%m_%d")
-    return f"logs/{date}/api_calls_{datehour}.csv"
+    return date, datehour
+
+def _api_log_blob_name_prices() -> str:
+    d, dh = _date_parts()
+    return f"logs/{d}/prices_{dh}.csv"
+
+def _api_log_blob_name_general() -> str:
+    d, dh = _date_parts()
+    return f"logs/{d}/api_calls_{dh}.csv"
 
 def _csv_line(values: List[Any]) -> str:
     sio = io.StringIO()
     csv.writer(sio, lineterminator="\n").writerow(values)
     return sio.getvalue()
 
-def _ensure_api_log_append_blob_with_header(logs_cc):
-    blob_name = _api_log_blob_name()
+def _ensure_api_log_append_blob_with_header(logs_cc, *, is_price: bool):
+    blob_name = _api_log_blob_name_prices() if is_price else _api_log_blob_name_general()
     bc = logs_cc.get_blob_client(blob_name)
     header = _csv_line(API_LOG_COLUMNS).encode("utf-8")
 
@@ -287,12 +276,15 @@ def _ensure_api_log_append_blob_with_header(logs_cc):
     except ResourceNotFoundError:
         bc.create_append_blob(); bc.append_block(header)
 
-def _append_api_csv_row(logs_cc, row_values: List[Any]):
-    _ensure_api_log_append_blob_with_header(logs_cc)
+def _append_api_csv_row(logs_cc, row_values: List[Any], *, is_price: bool):
+    _ensure_api_log_append_blob_with_header(logs_cc, is_price=is_price)
     line = _csv_line(row_values).encode("utf-8")
-    logs_cc.get_blob_client(_api_log_blob_name()).append_block(line)
+    blob_name = _api_log_blob_name_prices() if is_price else _api_log_blob_name_general()
+    logs_cc.get_blob_client(blob_name).append_block(line)
 
-def _append_api_csv(logs_cc, *, method: str, path: str, params: Dict[str, Any], status: Any, error: Optional[str], resp_text: Optional[str]):
+def _append_api_csv(logs_cc, *, method: str, path: str, params: Dict[str, Any],
+                    status: Any, error: Optional[str], resp_text: Optional[str],
+                    outbound_ip: Optional[str]):
     if not API_CSV_LOGGING:
         return
     params_ser = json.dumps(_sanitize_params(params or {}), ensure_ascii=False, separators=(",", ":"))
@@ -300,8 +292,90 @@ def _append_api_csv(logs_cc, *, method: str, path: str, params: Dict[str, Any], 
     if isinstance(sample, str) and len(sample) > 1000:
         sample = sample[:1000] + "..."
     sample = sample.replace("\r", " ").replace("\n", " ")
-    row = [_timestamp(), method, path, params_ser, str(status or ""), (error or ""), sample]
-    _append_api_csv_row(logs_cc, row)
+    row = [_timestamp(), method, path, params_ser, str(status or ""), (error or ""), sample, (outbound_ip or "")]
+    is_price = (path == "/api/v3/ticker/price")
+    _append_api_csv_row(logs_cc, row, is_price=is_price)
+
+# ========= HTTP helpers =========
+def api_get(session: requests.Session, path: str, params: Dict[str, Any], *, logs_cc=None) -> Any:
+    # Failover hostnames kvůli občasným 451/edge potížím
+    hosts = [
+        BASE_URL,
+        BASE_URL.replace("api.", "api1."),
+        BASE_URL.replace("api.", "api2."),
+        BASE_URL.replace("api.", "api3."),
+    ]
+    last_err = None
+    for base in hosts:
+        url = f"{base}{path}"
+        try:
+            r = session.get(url, params=params, headers=_headers(), timeout=TIMEOUT_S)
+            status = r.status_code
+            txt = r.text[:800] if isinstance(r.text, str) else ""
+            r.raise_for_status()
+            j = r.json()
+            _append_api_csv(logs_cc, method="GET", path=path, params=params, status=status, error=None, resp_text=txt, outbound_ip=None)
+            return j
+        except Exception as e:
+            last_err = e
+            status = getattr(getattr(e, "response", None), "status_code", "")
+            txt = ""
+            try:
+                txt = e.response.text[:800] if getattr(e, "response", None) is not None else ""
+            except Exception:
+                pass
+            _append_api_csv(logs_cc, method="GET", path=path, params=params, status=status, error=str(e), resp_text=txt, outbound_ip=None)
+            if status not in (451, 418, 429, 500, 503):
+                break
+            continue
+    raise last_err if last_err else RuntimeError("api_get failed")
+
+def api_signed_post(session: requests.Session, path: str, params: Dict[str, Any], *, logs_cc=None) -> Any:
+    """
+    Podepsaný POST — u /api/v3/order (BUY/SELL) navíc loguje do API CSV i OUTBOUND IP.
+    """
+    p = dict(params)
+    p["timestamp"] = _ts()
+    p["recvWindow"] = RECV_WINDOW
+    qs = urllib.parse.urlencode(p, doseq=True)
+    sig = _sign(qs)
+    url = f"{BASE_URL}{path}?{qs}&signature={sig}"
+
+    ip = _get_outbound_ip() if path == "/api/v3/order" else None
+    try:
+        r = session.post(url, headers=_headers(), timeout=TIMEOUT_S)
+        status = r.status_code
+        txt = r.text[:800] if isinstance(r.text, str) else ""
+        r.raise_for_status()
+        j = r.json()
+        _append_api_csv(logs_cc, method="POST", path=path, params=_sanitize_params(p), status=status, error=None, resp_text=txt, outbound_ip=ip)
+        return j
+    except Exception as e:
+        status = getattr(getattr(e, "response", None), "status_code", "")
+        txt = ""
+        try:
+            txt = e.response.text[:800] if getattr(e, "response", None) is not None else ""
+        except Exception:
+            pass
+        _append_api_csv(logs_cc, method="POST", path=path, params=_sanitize_params(p), status=status, error=str(e), resp_text=txt, outbound_ip=ip)
+        raise
+
+def get_price(session: requests.Session, symbol: str, *, logs_cc=None) -> float:
+    """
+    Primárně /ticker/price?symbol=..., při edge chybě 451/418/429 fallback:
+    /ticker/price (bulk) a vytáhneme cenu ze seznamu.
+    """
+    try:
+        j = api_get(session, "/api/v3/ticker/price", {"symbol": symbol}, logs_cc=logs_cc)
+        return float(j["price"])
+    except Exception as e:
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        if status in (451, 418, 429, 500, 503):
+            data = api_get(session, "/api/v3/ticker/price", {}, logs_cc=logs_cc)
+            mp = {str(d["symbol"]).upper(): float(d["price"]) for d in data}
+            if symbol.upper() in mp:
+                return mp[symbol.upper()]
+        raise
 
 # ========= Signals =========
 def _parse_pairs_models(val: str) -> List[Tuple[str, str]]:
@@ -508,13 +582,12 @@ def run_decision_for_pair(session: requests.Session,
     if status and status != "TRADING":
         logger.info("[%s/%s] status=%s → skip", pair, model, status); return
 
-    base = pair.replace("USDT","").replace("USDC","").replace("BUSD","")  # jednoduché odvození (pro AVAXUSDC → AVAX)
+    base = pair.replace("USDT","").replace("USDC","").replace("BUSD","")
     quote = "USDT" if pair.endswith("USDT") else ("USDC" if pair.endswith("USDC") else "USD")
 
     # ===== SELL =====
     target_S = st.get("s_level") if st.get("s_level") is not None else S
     if st.get("position") == "long" and px >= float(target_S):
-        # použij skutečný free zůstatek a ořízni dolů na stepSize
         free_base = _get_free_asset(session, logs_cc, base)
         raw = min(float(st.get("qty", 0.0)), float(free_base))
         raw = max(0.0, raw - (step * 1e-3))  # drobná rezerva
@@ -540,12 +613,10 @@ def run_decision_for_pair(session: requests.Session,
         avgp = _avg_fill_price(fills)
         fee_total, fee_asset = _sum_fee(fills)
 
-        # zůstatek po fillu → rozhodnutí o stavu
         free_after = _get_free_asset(session, logs_cc, base)
         rem = floor_step(float(free_after), step)
 
         if rem > 0.0:
-            # pozice zůstává (např. nelze celé prodat kvůli fee/step)
             new_state = {
                 "position": "long",
                 "qty": rem,
@@ -561,7 +632,7 @@ def run_decision_for_pair(session: requests.Session,
         # 1) STATE FIRST
         _write_blob_json(state_cc, s_name, new_state)
 
-        # 2) CSV LOG (použij S z state/fallback)
+        # 2) CSV LOG
         line = ",".join([
             _timestamp(), pair, model, "SELL",
             f"{executed_qty:.8f}",
@@ -598,11 +669,10 @@ def run_decision_for_pair(session: requests.Session,
         avgp = _avg_fill_price(fills)
         fee_total, fee_asset = _sum_fee(fills)
 
-        # skutečný zůstatek po BUY (fee může být v BASE → executedQty není přesná držba)
         free_after_buy = _get_free_asset(session, logs_cc, base)
         qty_hold = floor_step(float(free_after_buy), step)
 
-        # 1) STATE FIRST (vždy zapiš b_level/s_level)
+        # 1) STATE FIRST
         new_state = {
             "position": "long",
             "qty": qty_hold,
@@ -634,30 +704,12 @@ def run_decision_for_pair(session: requests.Session,
 
     logger.info("[%s/%s] No action (pos=%s px=%.8f B=%.8f S=%.8f)", pair, model, st.get("position"), px, B, S)
 
-# ========= Egress IP (diagnostika) =========
-def _egress_ip_info():
-    ip = None
-    try:
-        ip = requests.get("https://api.ipify.org?format=json", timeout=5).json().get("ip")
-    except Exception as e:
-        logger.warning("ipify failed: %s", e)
-    if not ip:
-        try:
-            ip = requests.get("https://ifconfig.me/ip", timeout=5).text.strip()
-        except Exception as e:
-            logger.warning("ifconfig.me failed: %s", e)
+# ========= Egress IP (jednorázové info) =========
+def _egress_ip_info_once():
+    ip = _get_outbound_ip()
     logger.info("Outbound IP=%s BASE_URL=%s TESTNET=%s", ip, BASE_URL, USE_TESTNET)
 
 # ========= Exchange/Prices orchestration =========
-def _pairs_only(val: str) -> List[str]:
-    out=[]; seen=set()
-    for piece in val.split(","):
-        piece=piece.strip()
-        if not piece or ":" not in piece: continue
-        p,_=piece.split(":",1); p=p.strip().upper()
-        if p not in seen: seen.add(p); out.append(p)
-    return out
-
 def _fetch_prices(session: requests.Session, logs_cc, pairs: List[str]) -> Dict[str, float]:
     return _fetch_prices_parallel(session, logs_cc, pairs)
 
@@ -668,15 +720,21 @@ def _exchangeinfo_blob_name_for_today() -> str:
 def main(mytimer: func.TimerRequest) -> None:
     try:
         _, models_cc, state_cc, logs_cc = _make_blob_clients()
-        _ensure_api_log_append_blob_with_header(logs_cc)
+        # headery pro oba CSV typy se vytvoří on-demand v _append_api_csv_row
 
         pairs_models = _parse_pairs_models(TRADE_PAIRS_MODELS)
         if not pairs_models:
             logger.error("TRADE_PAIRS_MODELS is empty"); return
-        pairs = _pairs_only(TRADE_PAIRS_MODELS)
+        pairs = []
+        seen=set()
+        for piece in TRADE_PAIRS_MODELS.split(","):
+            piece=piece.strip()
+            if not piece or ":" not in piece: continue
+            p,_=piece.split(":",1); p=p.strip().upper()
+            if p not in seen: seen.add(p); pairs.append(p)
 
         session = requests.Session()
-        _egress_ip_info()
+        _egress_ip_info_once()
 
         exch = _ensure_exchangeinfo_json_for_today(session, logs_cc, pairs)
         sig_map = _load_master_signals_map(models_cc)
